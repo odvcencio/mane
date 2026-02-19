@@ -1,0 +1,39 @@
+/* Mane Light Theme */
+* {
+  foreground: #1e1e2e;
+  background: #eff1f5;
+}
+
+DirectoryTree {
+  background: #e6e9ef;
+}
+
+TextArea {
+  background: #eff1f5;
+  foreground: #1e1e2e;
+}
+
+TextArea:focus {
+  border-color: #1e66f5;
+}
+
+CommandPalette {
+  background: #ccd0da;
+  foreground: #1e1e2e;
+  border: single;
+  border-color: #1e66f5;
+}
+
+Tabs {
+  background: #e6e9ef;
+  foreground: #6c6f85;
+}
+
+Label {
+  foreground: #1e1e2e;
+  background: #e6e9ef;
+}
+
+Splitter {
+  background: #eff1f5;
+}

@@ -2,17 +2,35 @@ package main
 
 import (
 	"context"
+	"embed"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/odvcencio/fluffyui/fluffy"
 	"github.com/odvcencio/fluffyui/state"
+	"github.com/odvcencio/fluffyui/style"
 	"github.com/odvcencio/fluffyui/widgets"
 
 	"github.com/odvcencio/mane/commands"
 	"github.com/odvcencio/mane/editor"
 )
+
+//go:embed themes/*.fss
+var themeFS embed.FS
+
+// loadTheme reads and parses a named FSS theme from the embedded themes directory.
+func loadTheme(name string) *style.Stylesheet {
+	data, err := themeFS.ReadFile("themes/" + name + ".fss")
+	if err != nil {
+		return nil // fall back to default
+	}
+	sheet, err := style.Parse(string(data))
+	if err != nil {
+		return nil
+	}
+	return sheet
+}
 
 // maneApp holds the core state for the editor application.
 type maneApp struct {
@@ -136,7 +154,9 @@ func (a *maneApp) cmdCloseTab() {
 
 // run constructs the editor layout and starts the FluffyUI app.
 func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) error {
-	_ = theme // reserved for future theme loading
+	if sheet := loadTheme(theme); sheet != nil {
+		opts = append(opts, fluffy.WithStylesheet(sheet))
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
