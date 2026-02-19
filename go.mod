@@ -2,7 +2,7 @@ module github.com/odvcencio/mane
 
 go 1.24.0
 
-require github.com/odvcencio/fluffyui v0.0.0
+require github.com/odvcencio/fluffyui v0.5.0
 
 require (
 	github.com/alecthomas/chroma/v2 v2.22.0 // indirect
@@ -26,5 +26,3 @@ require (
 	golang.org/x/term v0.40.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
-
-replace github.com/odvcencio/fluffyui => ../fluffyui
