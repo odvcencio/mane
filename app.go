@@ -10,6 +10,7 @@ import (
 	"github.com/odvcencio/fluffyui/state"
 	"github.com/odvcencio/fluffyui/widgets"
 
+	"github.com/odvcencio/mane/commands"
 	"github.com/odvcencio/mane/editor"
 )
 
@@ -19,6 +20,8 @@ type maneApp struct {
 	textArea *widgets.TextArea
 	fileTree *widgets.DirectoryTree
 	status   *state.Signal[string]
+	palette  *widgets.CommandPalette
+	cancel   context.CancelFunc // for quit command
 }
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
@@ -90,9 +93,53 @@ func (a *maneApp) updateStatus() {
 	a.status.Set(fmt.Sprintf(" %s%s  Ln %d, Col %d", buf.Title(), dirty, row+1, col+1))
 }
 
+// cmdSaveFile saves the active buffer to disk.
+func (a *maneApp) cmdSaveFile() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	if buf.Untitled() {
+		a.status.Set("Cannot save untitled file")
+		return
+	}
+	buf.SetText(a.textArea.Text())
+	if err := buf.Save(); err != nil {
+		a.status.Set(fmt.Sprintf("Save error: %v", err))
+		return
+	}
+	a.status.Set(fmt.Sprintf("Saved %s", buf.Title()))
+	a.updateStatus()
+}
+
+// cmdNewFile creates a new untitled buffer and switches to it.
+func (a *maneApp) cmdNewFile() {
+	a.tabs.NewUntitled()
+	a.textArea.SetText("")
+	a.updateStatus()
+}
+
+// cmdCloseTab closes the active tab and switches to the next buffer.
+func (a *maneApp) cmdCloseTab() {
+	if a.tabs.Count() == 0 {
+		return
+	}
+	a.tabs.Close(a.tabs.Active())
+	buf := a.tabs.ActiveBuffer()
+	if buf != nil {
+		a.textArea.SetText(buf.Text())
+	} else {
+		a.textArea.SetText("")
+	}
+	a.updateStatus()
+}
+
 // run constructs the editor layout and starts the FluffyUI app.
 func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) error {
 	_ = theme // reserved for future theme loading
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -112,6 +159,16 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 	}
 
 	app := newManeApp(treeRoot)
+	app.cancel = cancel
+
+	// Build the command palette with editor actions.
+	app.palette = widgets.NewCommandPalette(commands.AllCommands(commands.Actions{
+		SaveFile:      app.cmdSaveFile,
+		NewFile:       app.cmdNewFile,
+		CloseTab:      app.cmdCloseTab,
+		ToggleSidebar: func() {}, // placeholder
+		Quit:          func() { cancel() },
+	})...)
 
 	// Open files from CLI args, or create an untitled buffer if none.
 	for _, f := range filesToOpen {
@@ -138,5 +195,8 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 		fluffy.Fixed(statusBar),
 	)
 
-	return fluffy.RunContext(ctx, layout, opts...)
+	// Stack the palette on top of the layout for overlay rendering.
+	rootWidget := widgets.NewStack(layout, app.palette)
+
+	return fluffy.RunContext(ctx, rootWidget, opts...)
 }
