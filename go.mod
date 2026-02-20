@@ -2,10 +2,9 @@ module github.com/odvcencio/mane
 
 go 1.24.0
 
-require (
-	github.com/odvcencio/fluffyui v0.5.2
-	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
-)
+require github.com/odvcencio/fluffyui v0.5.2
+
+require github.com/stretchr/testify v1.9.0 // indirect
 
 require (
 	github.com/alecthomas/chroma/v2 v2.22.0 // indirect
@@ -19,6 +18,7 @@ require (
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
+	github.com/odvcencio/gotreesitter v0.1.0
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/u2takey/ffmpeg-go v0.5.0 // indirect
@@ -29,3 +29,5 @@ require (
 	golang.org/x/term v0.40.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace github.com/odvcencio/gotreesitter => ../gotreesitter

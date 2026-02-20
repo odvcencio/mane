@@ -19,10 +19,10 @@ import (
 	"github.com/odvcencio/fluffyui/terminal"
 	"github.com/odvcencio/fluffyui/widgets"
 
+	"github.com/odvcencio/gotreesitter"
+	"github.com/odvcencio/gotreesitter/grammars"
 	"github.com/odvcencio/mane/commands"
 	"github.com/odvcencio/mane/editor"
-	"github.com/odvcencio/mane/gotreesitter"
-	"github.com/odvcencio/mane/grammars"
 )
 
 //go:embed themes/*.fss
@@ -191,7 +191,7 @@ type globalKeys struct {
 }
 
 func (g *globalKeys) Measure(runtime.Constraints) runtime.Size { return runtime.Size{} }
-func (g *globalKeys) Render(runtime.RenderContext)              {}
+func (g *globalKeys) Render(runtime.RenderContext)             {}
 
 func (g *globalKeys) HandleMessage(msg runtime.Message) runtime.HandleResult {
 	if key, ok := msg.(runtime.KeyMsg); ok && g.onKey != nil {
