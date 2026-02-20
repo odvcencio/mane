@@ -222,7 +222,11 @@ type maneApp struct {
 	// Search state
 	searchMatches    []editor.Range
 	searchCurrent    int
-	syntaxHighlights []widgets.TextAreaHighlight // cached syntax highlights
+	syntaxHighlights  []widgets.TextAreaHighlight // cached syntax highlights
+	bracketHighlights []widgets.TextAreaHighlight // bracket match highlights
+
+	// Auto-indent state
+	suppressChange bool
 }
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
@@ -252,12 +256,46 @@ func newManeApp(treeRoot string) *maneApp {
 	)
 
 	app.textArea.SetOnChange(func(text string) {
+		if app.suppressChange {
+			return
+		}
 		buf := app.tabs.ActiveBuffer()
 		if buf == nil {
 			return
 		}
 		buf.SetText(text)
 		app.updateStatus()
+
+		// Auto-indent: detect if newline was just inserted
+		offset := app.textArea.CursorOffset()
+		runes := []rune(text)
+		if offset > 0 && offset <= len(runes) && runes[offset-1] == '\n' {
+			// Find the line above the cursor
+			// Convert rune offset to byte offset for string operations
+			byteOffset := len(string(runes[:offset-1]))
+			lineStart := strings.LastIndex(text[:byteOffset], "\n")
+			if lineStart < 0 {
+				lineStart = 0
+			} else {
+				lineStart++
+			}
+			lineAbove := text[lineStart:byteOffset]
+			indent := editor.ComputeIndent(lineAbove)
+			if indent != "" {
+				// Insert indent after the newline
+				newRunes := make([]rune, 0, len(runes)+len([]rune(indent)))
+				newRunes = append(newRunes, runes[:offset]...)
+				newRunes = append(newRunes, []rune(indent)...)
+				newRunes = append(newRunes, runes[offset:]...)
+				newText := string(newRunes)
+				buf.SetText(newText)
+				app.suppressChange = true
+				app.textArea.SetText(newText)
+				app.textArea.SetCursorOffset(offset + len([]rune(indent)))
+				app.suppressChange = false
+				text = newText // use new text for highlighting
+			}
+		}
 
 		// Debounced re-highlight on text change.
 		app.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
