@@ -31,3 +31,5 @@ require (
 )
 
 replace github.com/odvcencio/gotreesitter => ../gotreesitter
+
+replace github.com/odvcencio/fluffyui => ../fluffyui

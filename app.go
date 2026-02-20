@@ -205,6 +205,7 @@ type maneApp struct {
 	tabs      *editor.TabManager
 	textArea  *widgets.TextArea
 	fileTree  *widgets.DirectoryTree
+	tabBar    *tabBar
 	status    *state.Signal[string]
 	palette   *widgets.CommandPalette
 	search    *widgets.SearchWidget
@@ -231,6 +232,11 @@ func newManeApp(treeRoot string) *maneApp {
 		status:         state.NewSignal[string](" untitled"),
 		highlight:      newHighlightState(),
 		sidebarVisible: true,
+	}
+
+	app.tabBar = newTabBar()
+	app.tabBar.onClick = func(index int) {
+		app.switchTab(index)
 	}
 
 	app.textArea.SetLabel("Editor")
@@ -332,6 +338,7 @@ func (a *maneApp) openFile(path string) {
 	a.highlight.setup(filepath.Base(path))
 
 	a.syncTextArea()
+	a.syncTabBar()
 	a.updateStatus()
 
 	// Run initial highlight and apply to TextArea.
@@ -505,6 +512,55 @@ func (a *maneApp) applySearchHighlights() {
 	a.textArea.SetHighlights(merged)
 }
 
+// syncTabBar rebuilds the tab bar from the current TabManager state.
+func (a *maneApp) syncTabBar() {
+	buffers := a.tabs.Buffers()
+	tabs := make([]tabInfo, len(buffers))
+	for i, buf := range buffers {
+		tabs[i] = tabInfo{
+			title: buf.Title(),
+			dirty: buf.Dirty(),
+		}
+	}
+	a.tabBar.setTabs(tabs, a.tabs.Active())
+}
+
+// switchTab switches to the tab at the given index and reloads the TextArea.
+func (a *maneApp) switchTab(index int) {
+	a.tabs.SetActive(index)
+	buf := a.tabs.ActiveBuffer()
+	if buf != nil {
+		text := buf.Text()
+		a.textArea.SetText(text)
+		a.highlight.setup(filepath.Base(buf.Path()))
+		ranges := a.highlight.highlight([]byte(text))
+		a.applyHighlights(text, ranges)
+	}
+	a.syncTabBar()
+	a.updateStatus()
+}
+
+// prevTab switches to the previous tab (wrapping around).
+func (a *maneApp) prevTab() {
+	if a.tabs.Count() <= 1 {
+		return
+	}
+	idx := a.tabs.Active() - 1
+	if idx < 0 {
+		idx = a.tabs.Count() - 1
+	}
+	a.switchTab(idx)
+}
+
+// nextTab switches to the next tab (wrapping around).
+func (a *maneApp) nextTab() {
+	if a.tabs.Count() <= 1 {
+		return
+	}
+	idx := (a.tabs.Active() + 1) % a.tabs.Count()
+	a.switchTab(idx)
+}
+
 // cmdSaveFile saves the active buffer to disk.
 func (a *maneApp) cmdSaveFile() {
 	buf := a.tabs.ActiveBuffer()
@@ -529,6 +585,7 @@ func (a *maneApp) cmdNewFile() {
 	a.tabs.NewUntitled()
 	a.textArea.SetText("")
 	a.highlight.setup("") // no language for untitled
+	a.syncTabBar()
 	a.updateStatus()
 }
 
@@ -550,6 +607,7 @@ func (a *maneApp) cmdCloseTab() {
 		a.highlight.setup("")
 		a.textArea.ClearHighlights()
 	}
+	a.syncTabBar()
 	a.updateStatus()
 }
 
@@ -564,7 +622,7 @@ func (a *maneApp) cmdRedo() {
 }
 
 // run constructs the editor layout and starts the FluffyUI app.
-func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) error {
+func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOption) error {
 	sheet := loadTheme(theme)
 	if sheet != nil {
 		opts = append(opts, fluffy.WithStylesheet(sheet))
@@ -573,21 +631,39 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		absRoot = root
+	// Classify args into directories and files. Use the first directory
+	// (or the parent of the first file, or cwd) as the tree root.
+	var filesToOpen []string
+	treeRoot := ""
+
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			if treeRoot == "" {
+				treeRoot = abs
+			}
+		} else {
+			filesToOpen = append(filesToOpen, abs)
+			if treeRoot == "" {
+				treeRoot = filepath.Dir(abs)
+			}
+		}
 	}
 
-	// Determine whether root is a directory or a file.
-	// If a file, use its parent directory for the tree and open that file.
-	var filesToOpen []string
-	treeRoot := absRoot
-
-	info, err := os.Stat(absRoot)
-	if err == nil && !info.IsDir() {
-		// Root is a file: use its parent as the tree root.
-		treeRoot = filepath.Dir(absRoot)
-		filesToOpen = append(filesToOpen, absRoot)
+	if treeRoot == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			treeRoot = "."
+		} else {
+			treeRoot = cwd
+		}
 	}
 
 	app := newManeApp(treeRoot)
@@ -616,6 +692,7 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 		Quit:          func() { cancel() },
 		Undo:          app.cmdUndo,
 		Redo:          app.cmdRedo,
+		Find:          func() { app.cmdFind() },
 	})...)
 
 	// Open files from CLI args, or create an untitled buffer if none.
@@ -625,6 +702,7 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 	if app.tabs.Count() == 0 {
 		app.tabs.NewUntitled()
 		app.syncTextArea()
+		app.syncTabBar()
 		app.updateStatus()
 	}
 
@@ -640,8 +718,9 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 	// Content slot: swappable between splitter (sidebar visible) and textArea only.
 	app.slot = &contentSlot{child: app.splitter}
 
-	// Vertical layout: content fills space, status bar fixed at bottom.
+	// Vertical layout: tab bar, content fills space, status bar fixed at bottom.
 	layout := fluffy.VFlex(
+		fluffy.Fixed(app.tabBar),
 		fluffy.Expanded(app.slot),
 		fluffy.Fixed(statusBar),
 	)
@@ -657,6 +736,28 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 		case terminal.KeyCtrlB:
 			app.toggleSidebar()
 			return runtime.Handled()
+		case terminal.KeyCtrlS:
+			app.cmdSaveFile()
+			return runtime.Handled()
+		case terminal.KeyCtrlN:
+			app.cmdNewFile()
+			return runtime.Handled()
+		case terminal.KeyCtrlW:
+			app.cmdCloseTab()
+			return runtime.Handled()
+		case terminal.KeyCtrlQ:
+			cancel()
+			return runtime.Handled()
+		case terminal.KeyPageUp:
+			if key.Ctrl {
+				app.prevTab()
+				return runtime.Handled()
+			}
+		case terminal.KeyPageDown:
+			if key.Ctrl {
+				app.nextTab()
+				return runtime.Handled()
+			}
 		}
 		return runtime.Unhandled()
 	}}

@@ -16,11 +16,7 @@ func main() {
 	theme := flag.String("theme", "dark", "theme name")
 	flag.Parse()
 
-	// Use first positional arg as root directory, default to cwd.
-	root := "."
-	if flag.NArg() > 0 {
-		root = flag.Arg(0)
-	}
+	args := flag.Args()
 
 	var opts []fluffy.AppOption
 	if *web != "" {
@@ -33,7 +29,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := run(ctx, root, *theme, opts...); err != nil {
+	if err := run(ctx, args, *theme, opts...); err != nil {
 		fmt.Fprintf(os.Stderr, "mane: %v\n", err)
 		os.Exit(1)
 	}
