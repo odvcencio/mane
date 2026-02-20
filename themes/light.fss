@@ -37,3 +37,44 @@ Label {
 Splitter {
   background: #eff1f5;
 }
+
+/* Syntax Highlight Classes — Catppuccin Latte */
+.keyword {
+  foreground: #8839ef;
+}
+
+.string {
+  foreground: #40a02b;
+}
+
+.comment {
+  foreground: #9ca0b0;
+}
+
+.function {
+  foreground: #1e66f5;
+}
+
+.number {
+  foreground: #fe640b;
+}
+
+.variable {
+  foreground: #4c4f69;
+}
+
+.type {
+  foreground: #df8e1d;
+}
+
+.operator {
+  foreground: #04a5e5;
+}
+
+.constant {
+  foreground: #fe640b;
+}
+
+.property {
+  foreground: #179299;
+}

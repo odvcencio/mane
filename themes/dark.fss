@@ -37,3 +37,44 @@ Label {
 Splitter {
   background: #1e1e2e;
 }
+
+/* Syntax Highlight Classes — Catppuccin Mocha */
+.keyword {
+  foreground: #cba6f7;
+}
+
+.string {
+  foreground: #a6e3a1;
+}
+
+.comment {
+  foreground: #6c7086;
+}
+
+.function {
+  foreground: #89b4fa;
+}
+
+.number {
+  foreground: #fab387;
+}
+
+.variable {
+  foreground: #cdd6f4;
+}
+
+.type {
+  foreground: #f9e2af;
+}
+
+.operator {
+  foreground: #89dceb;
+}
+
+.constant {
+  foreground: #fab387;
+}
+
+.property {
+  foreground: #94e2d5;
+}

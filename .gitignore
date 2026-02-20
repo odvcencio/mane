@@ -9,3 +9,6 @@ mane
 
 # OS
 .DS_Store
+
+# Worktrees
+.worktrees/

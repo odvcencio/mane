@@ -4,13 +4,28 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// Range represents a byte range [Start, End) within buffer text.
+type Range struct {
+	Start, End int
+}
+
+// editOp records a single edit for undo/redo support.
+type editOp struct {
+	offset  int
+	oldText string
+	newText string
+}
 
 // Buffer manages the text content of a single open file.
 type Buffer struct {
 	path      string // absolute path, or "" if untitled
 	text      string // current text content
 	savedText string // text at last save/open (for dirty comparison)
+	undoStack []editOp
+	redoStack []editOp
 }
 
 // NewBuffer creates a new empty, untitled buffer.
@@ -99,4 +114,88 @@ func (b *Buffer) Title() string {
 		return "untitled"
 	}
 	return filepath.Base(b.path)
+}
+
+// ApplyEdit records the edit on the undo stack, clears the redo stack,
+// and applies the edit to the buffer text. The edit replaces the text at
+// [offset, offset+len(oldText)) with newText.
+func (b *Buffer) ApplyEdit(offset int, oldText, newText string) {
+	b.undoStack = append(b.undoStack, editOp{
+		offset:  offset,
+		oldText: oldText,
+		newText: newText,
+	})
+	b.redoStack = nil
+	b.text = b.text[:offset] + newText + b.text[offset+len(oldText):]
+}
+
+// Undo reverses the last edit. Returns true if an edit was undone, false if
+// the undo stack is empty.
+func (b *Buffer) Undo() bool {
+	if len(b.undoStack) == 0 {
+		return false
+	}
+	op := b.undoStack[len(b.undoStack)-1]
+	b.undoStack = b.undoStack[:len(b.undoStack)-1]
+	// Reverse the edit: replace newText back with oldText.
+	b.text = b.text[:op.offset] + op.oldText + b.text[op.offset+len(op.newText):]
+	b.redoStack = append(b.redoStack, op)
+	return true
+}
+
+// Redo reapplies the last undone edit. Returns true if an edit was redone,
+// false if the redo stack is empty.
+func (b *Buffer) Redo() bool {
+	if len(b.redoStack) == 0 {
+		return false
+	}
+	op := b.redoStack[len(b.redoStack)-1]
+	b.redoStack = b.redoStack[:len(b.redoStack)-1]
+	// Reapply the edit.
+	b.text = b.text[:op.offset] + op.newText + b.text[op.offset+len(op.oldText):]
+	b.undoStack = append(b.undoStack, op)
+	return true
+}
+
+// Find returns all byte ranges where query appears as a substring in the
+// buffer text. Returns nil if query is empty or not found.
+func (b *Buffer) Find(query string) []Range {
+	if query == "" {
+		return nil
+	}
+	var results []Range
+	start := 0
+	for {
+		idx := strings.Index(b.text[start:], query)
+		if idx < 0 {
+			break
+		}
+		absIdx := start + idx
+		results = append(results, Range{Start: absIdx, End: absIdx + len(query)})
+		start = absIdx + len(query)
+	}
+	return results
+}
+
+// Replace replaces the text at the given range with replacement, recording
+// the edit on the undo stack.
+func (b *Buffer) Replace(query, replacement string, r Range) {
+	oldText := b.text[r.Start:r.End]
+	b.ApplyEdit(r.Start, oldText, replacement)
+}
+
+// ReplaceAll replaces all occurrences of query with replacement. Returns the
+// number of replacements made. Each replacement is recorded as a single undo
+// operation processed from back to front so that offsets remain valid.
+func (b *Buffer) ReplaceAll(query, replacement string) int {
+	ranges := b.Find(query)
+	if len(ranges) == 0 {
+		return 0
+	}
+	// Apply replacements from back to front so earlier offsets stay valid.
+	for i := len(ranges) - 1; i >= 0; i-- {
+		r := ranges[i]
+		b.ApplyEdit(r.Start, query, replacement)
+	}
+	return len(ranges)
 }

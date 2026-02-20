@@ -344,3 +344,159 @@ func TestSaveAsCreatesIntermediateDirectories(t *testing.T) {
 		t.Errorf("file content = %q, want %q", string(data), "nested")
 	}
 }
+
+func TestBufferUndoRedo(t *testing.T) {
+	b := NewBuffer()
+	b.SetText("hello world")
+
+	// Apply an edit: replace "world" (offset 6, len 5) with "Go"
+	b.ApplyEdit(6, "world", "Go")
+	if b.Text() != "hello Go" {
+		t.Fatalf("after edit text = %q, want %q", b.Text(), "hello Go")
+	}
+
+	// Undo should restore "hello world"
+	if !b.Undo() {
+		t.Fatal("Undo returned false, expected true")
+	}
+	if b.Text() != "hello world" {
+		t.Fatalf("after undo text = %q, want %q", b.Text(), "hello world")
+	}
+
+	// Undo again should fail (stack empty)
+	if b.Undo() {
+		t.Fatal("Undo returned true on empty stack")
+	}
+
+	// Redo should reapply "hello Go"
+	if !b.Redo() {
+		t.Fatal("Redo returned false, expected true")
+	}
+	if b.Text() != "hello Go" {
+		t.Fatalf("after redo text = %q, want %q", b.Text(), "hello Go")
+	}
+
+	// Redo again should fail (stack empty)
+	if b.Redo() {
+		t.Fatal("Redo returned true on empty stack")
+	}
+
+	// New edit after undo should clear redo stack.
+	b.Undo()
+	b.ApplyEdit(6, "world", "Mane")
+	if b.Text() != "hello Mane" {
+		t.Fatalf("after second edit text = %q, want %q", b.Text(), "hello Mane")
+	}
+	if b.Redo() {
+		t.Fatal("Redo should return false after new edit clears redo stack")
+	}
+
+	// Multiple edits and undo chain
+	b.ApplyEdit(5, " ", " beautiful ")
+	if b.Text() != "hello beautiful Mane" {
+		t.Fatalf("text = %q, want %q", b.Text(), "hello beautiful Mane")
+	}
+	b.Undo()
+	if b.Text() != "hello Mane" {
+		t.Fatalf("after undo text = %q, want %q", b.Text(), "hello Mane")
+	}
+	b.Undo()
+	if b.Text() != "hello world" {
+		t.Fatalf("after double undo text = %q, want %q", b.Text(), "hello world")
+	}
+}
+
+func TestBufferFind(t *testing.T) {
+	b := NewBuffer()
+	b.SetText("the cat sat on the mat")
+
+	// Find "the" - should return 2 matches
+	results := b.Find("the")
+	if len(results) != 2 {
+		t.Fatalf("Find(\"the\") returned %d results, want 2", len(results))
+	}
+	if results[0].Start != 0 || results[0].End != 3 {
+		t.Errorf("first match = {%d,%d}, want {0,3}", results[0].Start, results[0].End)
+	}
+	if results[1].Start != 15 || results[1].End != 18 {
+		t.Errorf("second match = {%d,%d}, want {15,18}", results[1].Start, results[1].End)
+	}
+
+	// Find non-existent string
+	results = b.Find("dog")
+	if len(results) != 0 {
+		t.Errorf("Find(\"dog\") returned %d results, want 0", len(results))
+	}
+
+	// Find empty string
+	results = b.Find("")
+	if results != nil {
+		t.Errorf("Find(\"\") returned %v, want nil", results)
+	}
+
+	// Find single character
+	results = b.Find("a")
+	if len(results) != 3 {
+		t.Fatalf("Find(\"a\") returned %d results, want 3", len(results))
+	}
+}
+
+func TestBufferReplaceAll(t *testing.T) {
+	b := NewBuffer()
+	b.SetText("foo bar foo baz foo")
+
+	count := b.ReplaceAll("foo", "qux")
+	if count != 3 {
+		t.Fatalf("ReplaceAll returned count = %d, want 3", count)
+	}
+	if b.Text() != "qux bar qux baz qux" {
+		t.Fatalf("text = %q, want %q", b.Text(), "qux bar qux baz qux")
+	}
+
+	// Replace with longer string
+	b2 := NewBuffer()
+	b2.SetText("aaa")
+	count = b2.ReplaceAll("a", "bb")
+	if count != 3 {
+		t.Fatalf("ReplaceAll returned count = %d, want 3", count)
+	}
+	if b2.Text() != "bbbbbb" {
+		t.Fatalf("text = %q, want %q", b2.Text(), "bbbbbb")
+	}
+
+	// Replace with shorter string
+	b3 := NewBuffer()
+	b3.SetText("hello hello hello")
+	count = b3.ReplaceAll("hello", "hi")
+	if count != 3 {
+		t.Fatalf("ReplaceAll returned count = %d, want 3", count)
+	}
+	if b3.Text() != "hi hi hi" {
+		t.Fatalf("text = %q, want %q", b3.Text(), "hi hi hi")
+	}
+
+	// Replace no matches
+	b4 := NewBuffer()
+	b4.SetText("abc")
+	count = b4.ReplaceAll("xyz", "123")
+	if count != 0 {
+		t.Fatalf("ReplaceAll returned count = %d, want 0", count)
+	}
+	if b4.Text() != "abc" {
+		t.Fatalf("text = %q, want %q", b4.Text(), "abc")
+	}
+
+	// ReplaceAll should be undoable
+	b5 := NewBuffer()
+	b5.SetText("aa bb aa")
+	b5.ReplaceAll("aa", "cc")
+	if b5.Text() != "cc bb cc" {
+		t.Fatalf("text = %q, want %q", b5.Text(), "cc bb cc")
+	}
+	// Undo all the individual replacements
+	b5.Undo()
+	b5.Undo()
+	if b5.Text() != "aa bb aa" {
+		t.Fatalf("after undo text = %q, want %q", b5.Text(), "aa bb aa")
+	}
+}
