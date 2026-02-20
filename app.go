@@ -11,9 +11,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/odvcencio/fluffyui/backend"
 	"github.com/odvcencio/fluffyui/fluffy"
+	"github.com/odvcencio/fluffyui/runtime"
 	"github.com/odvcencio/fluffyui/state"
 	"github.com/odvcencio/fluffyui/style"
+	"github.com/odvcencio/fluffyui/terminal"
 	"github.com/odvcencio/fluffyui/widgets"
 
 	"github.com/odvcencio/mane/commands"
@@ -137,6 +140,66 @@ func (hs *highlightState) Ranges() []gotreesitter.HighlightRange {
 	return hs.ranges
 }
 
+// contentSlot is a simple wrapper widget whose child can be swapped at runtime.
+type contentSlot struct {
+	widgets.Base
+	child runtime.Widget
+}
+
+func (c *contentSlot) setChild(w runtime.Widget) {
+	c.child = w
+}
+
+func (c *contentSlot) Measure(constraints runtime.Constraints) runtime.Size {
+	if c.child != nil {
+		return c.child.Measure(constraints)
+	}
+	return runtime.Size{}
+}
+
+func (c *contentSlot) Layout(bounds runtime.Rect) {
+	c.Base.Layout(bounds)
+	if c.child != nil {
+		c.child.Layout(bounds)
+	}
+}
+
+func (c *contentSlot) Render(ctx runtime.RenderContext) {
+	if c.child != nil {
+		c.child.Render(ctx)
+	}
+}
+
+func (c *contentSlot) HandleMessage(msg runtime.Message) runtime.HandleResult {
+	if c.child != nil {
+		return c.child.HandleMessage(msg)
+	}
+	return runtime.Unhandled()
+}
+
+func (c *contentSlot) ChildWidgets() []runtime.Widget {
+	if c.child != nil {
+		return []runtime.Widget{c.child}
+	}
+	return nil
+}
+
+// globalKeys is an invisible widget that intercepts global key shortcuts.
+type globalKeys struct {
+	widgets.Base
+	onKey func(key runtime.KeyMsg) runtime.HandleResult
+}
+
+func (g *globalKeys) Measure(runtime.Constraints) runtime.Size { return runtime.Size{} }
+func (g *globalKeys) Render(runtime.RenderContext)              {}
+
+func (g *globalKeys) HandleMessage(msg runtime.Message) runtime.HandleResult {
+	if key, ok := msg.(runtime.KeyMsg); ok && g.onKey != nil {
+		return g.onKey(key)
+	}
+	return runtime.Unhandled()
+}
+
 // maneApp holds the core state for the editor application.
 type maneApp struct {
 	tabs      *editor.TabManager
@@ -144,18 +207,30 @@ type maneApp struct {
 	fileTree  *widgets.DirectoryTree
 	status    *state.Signal[string]
 	palette   *widgets.CommandPalette
+	search    *widgets.SearchWidget
 	cancel    context.CancelFunc // for quit command
 	highlight *highlightState
 	theme     *style.Stylesheet
+
+	// Sidebar toggle
+	sidebarVisible bool
+	splitter       *widgets.Splitter
+	slot           *contentSlot
+
+	// Search state
+	searchMatches    []editor.Range
+	searchCurrent    int
+	syntaxHighlights []widgets.TextAreaHighlight // cached syntax highlights
 }
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
 func newManeApp(treeRoot string) *maneApp {
 	app := &maneApp{
-		tabs:      editor.NewTabManager(),
-		textArea:  widgets.NewTextArea(),
-		status:    state.NewSignal[string](" untitled"),
-		highlight: newHighlightState(),
+		tabs:           editor.NewTabManager(),
+		textArea:       widgets.NewTextArea(),
+		status:         state.NewSignal[string](" untitled"),
+		highlight:      newHighlightState(),
+		sidebarVisible: true,
 	}
 
 	app.textArea.SetLabel("Editor")
@@ -208,6 +283,7 @@ func byteOffsetToRuneOffset(text string) []int {
 // and sets them on the TextArea.
 func (a *maneApp) applyHighlights(text string, ranges []gotreesitter.HighlightRange) {
 	if a.theme == nil || len(ranges) == 0 {
+		a.syntaxHighlights = nil
 		a.textArea.ClearHighlights()
 		return
 	}
@@ -237,6 +313,9 @@ func (a *maneApp) applyHighlights(text string, ranges []gotreesitter.HighlightRa
 			Style: bs,
 		})
 	}
+
+	// Cache syntax highlights for merging with search highlights
+	a.syntaxHighlights = highlights
 	a.textArea.SetHighlights(highlights)
 }
 
@@ -296,6 +375,134 @@ func (a *maneApp) updateStatus() {
 
 	col, row := a.textArea.CursorPosition()
 	a.status.Set(fmt.Sprintf(" %s%s%s  Ln %d, Col %d", buf.Title(), dirty, langName, row+1, col+1))
+}
+
+// toggleSidebar shows or hides the file tree sidebar.
+func (a *maneApp) toggleSidebar() {
+	a.sidebarVisible = !a.sidebarVisible
+	if a.sidebarVisible {
+		a.slot.setChild(a.splitter)
+	} else {
+		a.slot.setChild(a.textArea)
+	}
+}
+
+// cmdFind opens the search widget as an overlay.
+func (a *maneApp) cmdFind() runtime.HandleResult {
+	a.search.Focus()
+	return runtime.WithCommand(runtime.PushOverlay{Widget: a.search})
+}
+
+// onSearch handles search query changes from the SearchWidget.
+func (a *maneApp) onSearch(query string) {
+	if query == "" {
+		a.searchMatches = nil
+		a.searchCurrent = 0
+		a.search.SetMatchInfo(0, 0)
+		// Restore syntax-only highlights
+		a.textArea.SetHighlights(a.syntaxHighlights)
+		return
+	}
+
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	// Find matches (byte ranges)
+	a.searchMatches = buf.Find(query)
+	a.searchCurrent = 0
+
+	if len(a.searchMatches) > 0 {
+		a.search.SetMatchInfo(0, len(a.searchMatches))
+		// Jump to first match
+		a.jumpToMatch(0)
+	} else {
+		a.search.SetMatchInfo(0, 0)
+	}
+
+	a.applySearchHighlights()
+}
+
+// onSearchNext moves to the next search match.
+func (a *maneApp) onSearchNext() {
+	if len(a.searchMatches) == 0 {
+		return
+	}
+	a.searchCurrent = (a.searchCurrent + 1) % len(a.searchMatches)
+	a.search.SetMatchInfo(a.searchCurrent, len(a.searchMatches))
+	a.jumpToMatch(a.searchCurrent)
+	a.applySearchHighlights()
+}
+
+// onSearchPrev moves to the previous search match.
+func (a *maneApp) onSearchPrev() {
+	if len(a.searchMatches) == 0 {
+		return
+	}
+	a.searchCurrent--
+	if a.searchCurrent < 0 {
+		a.searchCurrent = len(a.searchMatches) - 1
+	}
+	a.search.SetMatchInfo(a.searchCurrent, len(a.searchMatches))
+	a.jumpToMatch(a.searchCurrent)
+	a.applySearchHighlights()
+}
+
+// onSearchClose clears search state when the search widget is dismissed.
+func (a *maneApp) onSearchClose() {
+	a.searchMatches = nil
+	a.searchCurrent = 0
+	// Restore syntax-only highlights
+	a.textArea.SetHighlights(a.syntaxHighlights)
+}
+
+// jumpToMatch moves the cursor to the given match index.
+func (a *maneApp) jumpToMatch(idx int) {
+	if idx < 0 || idx >= len(a.searchMatches) {
+		return
+	}
+	m := a.searchMatches[idx]
+	text := a.textArea.Text()
+	mapping := byteOffsetToRuneOffset(text)
+	runeStart := mapping[m.Start]
+	a.textArea.SetCursorOffset(runeStart)
+}
+
+// applySearchHighlights merges syntax highlights with search match highlights.
+func (a *maneApp) applySearchHighlights() {
+	text := a.textArea.Text()
+	mapping := byteOffsetToRuneOffset(text)
+
+	// Start with syntax highlights
+	merged := make([]widgets.TextAreaHighlight, len(a.syntaxHighlights))
+	copy(merged, a.syntaxHighlights)
+
+	// Match styles
+	matchStyle := backend.DefaultStyle().Background(backend.ColorYellow).Foreground(backend.ColorBlack)
+	currentStyle := backend.DefaultStyle().Background(backend.ColorRGB(0xFF, 0x88, 0x00)).Foreground(backend.ColorBlack)
+
+	for i, m := range a.searchMatches {
+		start := m.Start
+		end := m.End
+		if start > len(text) {
+			start = len(text)
+		}
+		if end > len(text) {
+			end = len(text)
+		}
+		s := matchStyle
+		if i == a.searchCurrent {
+			s = currentStyle
+		}
+		merged = append(merged, widgets.TextAreaHighlight{
+			Start: mapping[start],
+			End:   mapping[end],
+			Style: s,
+		})
+	}
+
+	a.textArea.SetHighlights(merged)
 }
 
 // cmdSaveFile saves the active buffer to disk.
@@ -394,12 +601,18 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 		}
 	}
 
+	// Set up search widget
+	app.search = widgets.NewSearchWidget()
+	app.search.SetOnSearch(app.onSearch)
+	app.search.SetOnNavigate(app.onSearchNext, app.onSearchPrev)
+	app.search.SetOnClose(app.onSearchClose)
+
 	// Build the command palette with editor actions.
 	app.palette = widgets.NewCommandPalette(commands.AllCommands(commands.Actions{
 		SaveFile:      app.cmdSaveFile,
 		NewFile:       app.cmdNewFile,
 		CloseTab:      app.cmdCloseTab,
-		ToggleSidebar: func() {}, // placeholder
+		ToggleSidebar: app.toggleSidebar,
 		Quit:          func() { cancel() },
 		Undo:          app.cmdUndo,
 		Redo:          app.cmdRedo,
@@ -421,17 +634,35 @@ func run(ctx context.Context, root, theme string, opts ...fluffy.AppOption) erro
 	}, app.status)
 
 	// Horizontal split: file tree (22%) | editor (78%).
-	splitter := widgets.NewSplitter(app.fileTree, app.textArea)
-	splitter.Ratio = 0.22
+	app.splitter = widgets.NewSplitter(app.fileTree, app.textArea)
+	app.splitter.Ratio = 0.22
 
-	// Vertical layout: splitter fills space, status bar fixed at bottom.
+	// Content slot: swappable between splitter (sidebar visible) and textArea only.
+	app.slot = &contentSlot{child: app.splitter}
+
+	// Vertical layout: content fills space, status bar fixed at bottom.
 	layout := fluffy.VFlex(
-		fluffy.Expanded(splitter),
+		fluffy.Expanded(app.slot),
 		fluffy.Fixed(statusBar),
 	)
 
-	// Stack the palette on top of the layout for overlay rendering.
-	rootWidget := widgets.NewStack(layout, app.palette)
+	// Global key interceptor for shortcuts that need to work regardless of focus.
+	keys := &globalKeys{onKey: func(key runtime.KeyMsg) runtime.HandleResult {
+		switch key.Key {
+		case terminal.KeyCtrlP:
+			app.palette.Toggle()
+			return runtime.Handled()
+		case terminal.KeyCtrlF:
+			return app.cmdFind()
+		case terminal.KeyCtrlB:
+			app.toggleSidebar()
+			return runtime.Handled()
+		}
+		return runtime.Unhandled()
+	}}
+
+	// Stack: layout at bottom, palette in middle, global keys on top (gets events first).
+	rootWidget := widgets.NewStack(layout, app.palette, keys)
 
 	return fluffy.RunContext(ctx, rootWidget, opts...)
 }
