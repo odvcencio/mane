@@ -764,6 +764,87 @@ func (a *maneApp) cmdRedo() {
 	a.textArea.Redo()
 }
 
+// rehighlight runs a synchronous highlight pass and applies the results.
+func (a *maneApp) rehighlight(text string) {
+	ranges := a.highlight.highlight([]byte(text))
+	a.applyHighlights(text, ranges)
+}
+
+// cmdDeleteLine deletes the line at the current cursor position.
+func (a *maneApp) cmdDeleteLine() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	col, row := a.textArea.CursorPosition()
+	text := buf.Text()
+	text = editor.DeleteLine(text, row)
+	buf.SetText(text)
+	a.textArea.SetText(text)
+	// Clamp cursor row if it fell off the end.
+	maxRow := editor.LineCount(text) - 1
+	if row > maxRow {
+		row = maxRow
+	}
+	a.textArea.SetCursorPosition(col, row)
+	a.rehighlight(text)
+	a.updateStatus()
+}
+
+// cmdMoveLineUp moves the current line up by one position.
+func (a *maneApp) cmdMoveLineUp() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	col, row := a.textArea.CursorPosition()
+	text := buf.Text()
+	newText := editor.MoveLine(text, row, -1)
+	if newText == text {
+		return
+	}
+	buf.SetText(newText)
+	a.textArea.SetText(newText)
+	a.textArea.SetCursorPosition(col, row-1)
+	a.rehighlight(newText)
+	a.updateStatus()
+}
+
+// cmdMoveLineDown moves the current line down by one position.
+func (a *maneApp) cmdMoveLineDown() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	col, row := a.textArea.CursorPosition()
+	text := buf.Text()
+	newText := editor.MoveLine(text, row, 1)
+	if newText == text {
+		return
+	}
+	buf.SetText(newText)
+	a.textArea.SetText(newText)
+	a.textArea.SetCursorPosition(col, row+1)
+	a.rehighlight(newText)
+	a.updateStatus()
+}
+
+// cmdDuplicateLine duplicates the current line below the cursor.
+func (a *maneApp) cmdDuplicateLine() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	col, row := a.textArea.CursorPosition()
+	text := buf.Text()
+	text = editor.DuplicateLine(text, row)
+	buf.SetText(text)
+	a.textArea.SetText(text)
+	a.textArea.SetCursorPosition(col, row+1)
+	a.rehighlight(text)
+	a.updateStatus()
+}
+
 // run constructs the editor layout and starts the FluffyUI app.
 func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOption) error {
 	sheet := loadTheme(theme)
@@ -846,6 +927,10 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 		Redo:          app.cmdRedo,
 		Find:          func() { app.cmdFind() },
 		Replace:       func() { app.cmdReplace() },
+		DeleteLine:    app.cmdDeleteLine,
+		MoveLineUp:    app.cmdMoveLineUp,
+		MoveLineDown:  app.cmdMoveLineDown,
+		DuplicateLine: app.cmdDuplicateLine,
 	})...)
 
 	// Open files from CLI args, or create an untitled buffer if none.
@@ -890,6 +975,14 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 			if key.Ctrl && key.Rune == 'h' {
 				return app.cmdReplace()
 			}
+			if key.Ctrl && key.Shift && key.Rune == 'K' {
+				app.cmdDeleteLine()
+				return runtime.Handled()
+			}
+			if key.Ctrl && key.Shift && key.Rune == 'D' {
+				app.cmdDuplicateLine()
+				return runtime.Handled()
+			}
 		case terminal.KeyCtrlB:
 			app.toggleSidebar()
 			return runtime.Handled()
@@ -905,6 +998,16 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 		case terminal.KeyCtrlQ:
 			cancel()
 			return runtime.Handled()
+		case terminal.KeyUp:
+			if key.Alt {
+				app.cmdMoveLineUp()
+				return runtime.Handled()
+			}
+		case terminal.KeyDown:
+			if key.Alt {
+				app.cmdMoveLineDown()
+				return runtime.Handled()
+			}
 		case terminal.KeyPageUp:
 			if key.Ctrl {
 				app.prevTab()

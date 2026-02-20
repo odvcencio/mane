@@ -13,6 +13,10 @@ type Actions struct {
 	Redo          func()
 	Find          func()
 	Replace       func()
+	DeleteLine    func()
+	MoveLineUp    func()
+	MoveLineDown  func()
+	DuplicateLine func()
 }
 
 // AllCommands returns the full command list for the palette.
@@ -27,5 +31,9 @@ func AllCommands(a Actions) []widgets.PaletteCommand {
 		{ID: "edit.redo", Label: "Redo", Shortcut: "Ctrl+Shift+Z", Category: "Edit", OnExecute: a.Redo},
 		{ID: "edit.find", Label: "Find", Shortcut: "Ctrl+F", Category: "Edit", OnExecute: a.Find},
 		{ID: "edit.replace", Label: "Replace", Shortcut: "Ctrl+H", Category: "Edit", OnExecute: a.Replace},
+		{ID: "edit.deleteLine", Label: "Delete Line", Shortcut: "Ctrl+Shift+K", Category: "Edit", OnExecute: a.DeleteLine},
+		{ID: "edit.moveLineUp", Label: "Move Line Up", Shortcut: "Alt+Up", Category: "Edit", OnExecute: a.MoveLineUp},
+		{ID: "edit.moveLineDown", Label: "Move Line Down", Shortcut: "Alt+Down", Category: "Edit", OnExecute: a.MoveLineDown},
+		{ID: "edit.duplicateLine", Label: "Duplicate Line", Shortcut: "Ctrl+Shift+D", Category: "Edit", OnExecute: a.DuplicateLine},
 	}
 }
