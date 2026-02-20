@@ -301,6 +301,8 @@ func newManeApp(treeRoot string) *maneApp {
 		app.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 			app.applyHighlights(text, ranges)
 		})
+
+		app.updateBracketMatch()
 	})
 
 	return app
@@ -659,37 +661,71 @@ func (a *maneApp) jumpToMatch(idx int) {
 
 // applySearchHighlights merges syntax highlights with search match highlights.
 func (a *maneApp) applySearchHighlights() {
+	a.mergeAllHighlights()
+}
+
+// updateBracketMatch updates bracket highlight state based on the current
+// cursor position. It checks the character at the cursor and the character
+// before the cursor for bracket characters.
+func (a *maneApp) updateBracketMatch() {
 	text := a.textArea.Text()
-	mapping := byteOffsetToRuneOffset(text)
+	offset := a.textArea.CursorOffset()
 
-	// Start with syntax highlights
-	merged := make([]widgets.TextAreaHighlight, len(a.syntaxHighlights))
-	copy(merged, a.syntaxHighlights)
+	a.bracketHighlights = nil
 
-	// Match styles
-	matchStyle := backend.DefaultStyle().Background(backend.ColorYellow).Foreground(backend.ColorBlack)
-	currentStyle := backend.DefaultStyle().Background(backend.ColorRGB(0xFF, 0x88, 0x00)).Foreground(backend.ColorBlack)
+	bracketStyle := backend.DefaultStyle().Background(backend.ColorRGB(0x44, 0x44, 0x44))
 
-	for i, m := range a.searchMatches {
-		start := m.Start
-		end := m.End
-		if start > len(text) {
-			start = len(text)
+	// Check character at cursor and before cursor
+	runes := []rune(text)
+	for _, pos := range []int{offset, offset - 1} {
+		if pos < 0 || pos >= len(runes) {
+			continue
 		}
-		if end > len(text) {
-			end = len(text)
+		matchPos, ok := editor.FindMatchingBracket(text, pos)
+		if ok {
+			a.bracketHighlights = []widgets.TextAreaHighlight{
+				{Start: pos, End: pos + 1, Style: bracketStyle},
+				{Start: matchPos, End: matchPos + 1, Style: bracketStyle},
+			}
+			break
 		}
-		s := matchStyle
-		if i == a.searchCurrent {
-			s = currentStyle
-		}
-		merged = append(merged, widgets.TextAreaHighlight{
-			Start: mapping[start],
-			End:   mapping[end],
-			Style: s,
-		})
 	}
 
+	a.mergeAllHighlights()
+}
+
+// mergeAllHighlights combines all highlight layers (syntax, brackets, search)
+// and sets the merged result on the TextArea.
+func (a *maneApp) mergeAllHighlights() {
+	var merged []widgets.TextAreaHighlight
+	merged = append(merged, a.syntaxHighlights...)
+	merged = append(merged, a.bracketHighlights...)
+	// If search is active, add search highlights on top
+	if len(a.searchMatches) > 0 {
+		text := a.textArea.Text()
+		mapping := byteOffsetToRuneOffset(text)
+		matchStyle := backend.DefaultStyle().Background(backend.ColorYellow).Foreground(backend.ColorBlack)
+		currentStyle := backend.DefaultStyle().Background(backend.ColorRGB(0xFF, 0x88, 0x00)).Foreground(backend.ColorBlack)
+		for i, m := range a.searchMatches {
+			start := m.Start
+			end := m.End
+			if start > len(text) {
+				start = len(text)
+			}
+			if end > len(text) {
+				end = len(text)
+			}
+			s := matchStyle
+			if i == a.searchCurrent {
+				s = currentStyle
+			}
+			merged = append(merged, widgets.TextAreaHighlight{
+				Start: mapping[start],
+				End:   mapping[end],
+				Style: s,
+			})
+		}
+	}
 	a.textArea.SetHighlights(merged)
 }
 
