@@ -209,6 +209,7 @@ type maneApp struct {
 	status    *state.Signal[string]
 	palette   *widgets.CommandPalette
 	search    *widgets.SearchWidget
+	replaceW  *replaceWidget
 	cancel    context.CancelFunc // for quit command
 	highlight *highlightState
 	theme     *style.Stylesheet
@@ -464,6 +465,148 @@ func (a *maneApp) onSearchClose() {
 	a.textArea.SetHighlights(a.syntaxHighlights)
 }
 
+// cmdReplace opens the replace widget as an overlay.
+func (a *maneApp) cmdReplace() runtime.HandleResult {
+	a.replaceW.Focus()
+	return runtime.WithCommand(runtime.PushOverlay{Widget: a.replaceW})
+}
+
+// onReplaceSearch handles search query changes from the replace widget.
+// It reuses the same search state as cmdFind so highlights stay consistent.
+func (a *maneApp) onReplaceSearch(query string) {
+	if query == "" {
+		a.searchMatches = nil
+		a.searchCurrent = 0
+		a.replaceW.SetMatchInfo(0, 0)
+		a.textArea.SetHighlights(a.syntaxHighlights)
+		return
+	}
+
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	a.searchMatches = buf.Find(query)
+	a.searchCurrent = 0
+
+	if len(a.searchMatches) > 0 {
+		a.replaceW.SetMatchInfo(0, len(a.searchMatches))
+		a.jumpToMatch(0)
+	} else {
+		a.replaceW.SetMatchInfo(0, 0)
+	}
+
+	a.applySearchHighlights()
+}
+
+// onReplaceNext moves to the next search match (from replace widget).
+func (a *maneApp) onReplaceNext() {
+	if len(a.searchMatches) == 0 {
+		return
+	}
+	a.searchCurrent = (a.searchCurrent + 1) % len(a.searchMatches)
+	a.replaceW.SetMatchInfo(a.searchCurrent, len(a.searchMatches))
+	a.jumpToMatch(a.searchCurrent)
+	a.applySearchHighlights()
+}
+
+// onReplacePrev moves to the previous search match (from replace widget).
+func (a *maneApp) onReplacePrev() {
+	if len(a.searchMatches) == 0 {
+		return
+	}
+	a.searchCurrent--
+	if a.searchCurrent < 0 {
+		a.searchCurrent = len(a.searchMatches) - 1
+	}
+	a.replaceW.SetMatchInfo(a.searchCurrent, len(a.searchMatches))
+	a.jumpToMatch(a.searchCurrent)
+	a.applySearchHighlights()
+}
+
+// onReplace replaces the current search match and advances to the next one.
+func (a *maneApp) onReplace(search, replace string) {
+	if search == "" || len(a.searchMatches) == 0 {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	// Replace the current match.
+	if a.searchCurrent >= 0 && a.searchCurrent < len(a.searchMatches) {
+		r := a.searchMatches[a.searchCurrent]
+		buf.Replace(search, replace, editor.Range{Start: r.Start, End: r.End})
+	}
+
+	// Re-sync the text area from the buffer.
+	a.syncTextArea()
+	a.updateStatus()
+
+	// Re-run search to refresh matches with updated text.
+	a.searchMatches = buf.Find(search)
+	if len(a.searchMatches) == 0 {
+		a.searchCurrent = 0
+		a.replaceW.SetMatchInfo(0, 0)
+		a.textArea.SetHighlights(a.syntaxHighlights)
+		return
+	}
+
+	// Keep cursor at same index, clamped to new match count.
+	if a.searchCurrent >= len(a.searchMatches) {
+		a.searchCurrent = 0
+	}
+	a.replaceW.SetMatchInfo(a.searchCurrent, len(a.searchMatches))
+	a.jumpToMatch(a.searchCurrent)
+	a.applySearchHighlights()
+
+	// Re-highlight syntax.
+	text := buf.Text()
+	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
+		a.applyHighlights(text, ranges)
+	})
+}
+
+// onReplaceAll replaces all occurrences and updates the UI.
+func (a *maneApp) onReplaceAll(search, replace string) {
+	if search == "" {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	count := buf.ReplaceAll(search, replace)
+
+	// Re-sync the text area from the buffer.
+	a.syncTextArea()
+	a.updateStatus()
+
+	// Clear search state since all matches are gone.
+	a.searchMatches = nil
+	a.searchCurrent = 0
+	a.replaceW.SetMatchInfo(0, 0)
+	a.textArea.SetHighlights(a.syntaxHighlights)
+
+	a.status.Set(fmt.Sprintf(" Replaced %d occurrence(s)", count))
+
+	// Re-highlight syntax.
+	text := buf.Text()
+	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
+		a.applyHighlights(text, ranges)
+	})
+}
+
+// onReplaceClose clears search state when the replace widget is dismissed.
+func (a *maneApp) onReplaceClose() {
+	a.searchMatches = nil
+	a.searchCurrent = 0
+	a.textArea.SetHighlights(a.syntaxHighlights)
+}
+
 // jumpToMatch moves the cursor to the given match index.
 func (a *maneApp) jumpToMatch(idx int) {
 	if idx < 0 || idx >= len(a.searchMatches) {
@@ -683,6 +826,15 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 	app.search.SetOnNavigate(app.onSearchNext, app.onSearchPrev)
 	app.search.SetOnClose(app.onSearchClose)
 
+	// Set up replace widget
+	app.replaceW = newReplaceWidget()
+	app.replaceW.onSearch = app.onReplaceSearch
+	app.replaceW.onNext = app.onReplaceNext
+	app.replaceW.onPrev = app.onReplacePrev
+	app.replaceW.onReplace = app.onReplace
+	app.replaceW.onReplaceAll = app.onReplaceAll
+	app.replaceW.onClose = app.onReplaceClose
+
 	// Build the command palette with editor actions.
 	app.palette = widgets.NewCommandPalette(commands.AllCommands(commands.Actions{
 		SaveFile:      app.cmdSaveFile,
@@ -693,6 +845,7 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 		Undo:          app.cmdUndo,
 		Redo:          app.cmdRedo,
 		Find:          func() { app.cmdFind() },
+		Replace:       func() { app.cmdReplace() },
 	})...)
 
 	// Open files from CLI args, or create an untitled buffer if none.
@@ -733,6 +886,10 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 			return runtime.Handled()
 		case terminal.KeyCtrlF:
 			return app.cmdFind()
+		case terminal.KeyRune:
+			if key.Ctrl && key.Rune == 'h' {
+				return app.cmdReplace()
+			}
 		case terminal.KeyCtrlB:
 			app.toggleSidebar()
 			return runtime.Handled()
