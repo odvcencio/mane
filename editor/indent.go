@@ -10,7 +10,7 @@ func DetectIndentStyle(text string) string {
 	spaceCount := 0
 	minSpaceWidth := 0
 
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if len(line) == 0 {
 			continue
 		}
@@ -41,7 +41,8 @@ func DetectIndentStyle(text string) string {
 
 // ComputeIndent returns the indentation string to use for a new line after
 // the given line. It copies the existing indent and increases it if the line
-// ends with an opening bracket ({, (, [) after trimming trailing whitespace.
+// ends with a block-opening token ({, (, [, :) after trimming trailing
+// whitespace.
 func ComputeIndent(line string) string {
 	// Extract leading whitespace.
 	indent := ""
@@ -56,12 +57,31 @@ func ComputeIndent(line string) string {
 	trimmed := strings.TrimRight(line, " \t")
 	if len(trimmed) > 0 {
 		last := trimmed[len(trimmed)-1]
-		if last == '{' || last == '(' || last == '[' {
+		switch last {
+		case '{', '(', '[':
 			// Determine indent unit from current indent.
 			if strings.Contains(indent, "\t") || indent == "" {
 				indent += "\t"
 			} else {
 				indent += "    "
+			}
+		case ':':
+			// Python-style blocks: increase indentation after colon.
+			if strings.Contains(indent, "\t") || indent == "" {
+				indent += "\t"
+			} else {
+				// Reuse the current space indentation width.
+				spaces := 0
+				for _, ch := range indent {
+					if ch != ' ' {
+						break
+					}
+					spaces++
+				}
+				if spaces <= 0 {
+					spaces = 4
+				}
+				indent += strings.Repeat(" ", spaces)
 			}
 		}
 	}

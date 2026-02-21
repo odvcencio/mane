@@ -13,6 +13,8 @@ func TestComputeIndent(t *testing.T) {
 		{"preserve space indent", "    hello", "    "},
 		{"increase after brace", "\tif x {", "\t\t"},
 		{"increase after paren with spaces", "    func(", "        "},
+		{"increase after colon with spaces", "    if condition:", "        "},
+		{"increase after tabbed colon", "\tif condition:", "\t\t"},
 		{"empty line", "", ""},
 		{"only whitespace", "    ", "    "},
 		{"increase after bracket", "items [", "\t"},

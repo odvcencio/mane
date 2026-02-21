@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mane Editor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <div class="tabbar" id="tabbar"></div>
+    <div class="main">
+      <div class="sidebar">
+        <div class="sidebar-header">Explorer</div>
+        <div class="file-tree" id="file-tree"></div>
+      </div>
+      <div class="editor-container" id="editor-container">
+        <div class="welcome">
+          <h1>Mane</h1>
+          <p>Select a file from the sidebar to begin editing</p>
+        </div>
+      </div>
+    </div>
+    <div class="statusbar">
+      <div class="left">
+        <span class="connection">
+          <span class="dot" id="conn-dot"></span>
+        </span>
+        <span id="status-file"></span>
+      </div>
+      <div class="right">
+        <span id="status-pos">Ln 1, Col 1</span>
+        <span id="status-lang">PLAINTEXT</span>
+      </div>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

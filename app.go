@@ -3,15 +3,21 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/odvcencio/fluffyui/backend"
+	"github.com/odvcencio/fluffyui/clipboard"
 	"github.com/odvcencio/fluffyui/fluffy"
 	"github.com/odvcencio/fluffyui/runtime"
 	"github.com/odvcencio/fluffyui/state"
@@ -23,6 +29,7 @@ import (
 	"github.com/odvcencio/gotreesitter/grammars"
 	"github.com/odvcencio/mane/commands"
 	"github.com/odvcencio/mane/editor"
+	"github.com/odvcencio/mane/lsp"
 )
 
 //go:embed themes/*.fss
@@ -187,13 +194,25 @@ func (c *contentSlot) ChildWidgets() []runtime.Widget {
 // globalKeys is an invisible widget that intercepts global key shortcuts.
 type globalKeys struct {
 	widgets.Base
-	onKey func(key runtime.KeyMsg) runtime.HandleResult
+	onKey   func(key runtime.KeyMsg) runtime.HandleResult
+	onMouse func(mouse runtime.MouseMsg) runtime.HandleResult
+	onPaste func(paste runtime.PasteMsg) runtime.HandleResult
 }
 
 func (g *globalKeys) Measure(runtime.Constraints) runtime.Size { return runtime.Size{} }
 func (g *globalKeys) Render(runtime.RenderContext)             {}
 
 func (g *globalKeys) HandleMessage(msg runtime.Message) runtime.HandleResult {
+	if mouse, ok := msg.(runtime.MouseMsg); ok && g.onMouse != nil {
+		if result := g.onMouse(mouse); result.Handled {
+			return result
+		}
+	}
+	if paste, ok := msg.(runtime.PasteMsg); ok && g.onPaste != nil {
+		if result := g.onPaste(paste); result.Handled {
+			return result
+		}
+	}
 	if key, ok := msg.(runtime.KeyMsg); ok && g.onKey != nil {
 		return g.onKey(key)
 	}
@@ -202,17 +221,21 @@ func (g *globalKeys) HandleMessage(msg runtime.Message) runtime.HandleResult {
 
 // maneApp holds the core state for the editor application.
 type maneApp struct {
-	tabs      *editor.TabManager
-	textArea  *widgets.TextArea
-	fileTree  *widgets.DirectoryTree
-	tabBar    *tabBar
-	status    *state.Signal[string]
-	palette   *widgets.CommandPalette
-	search    *widgets.SearchWidget
-	replaceW  *replaceWidget
-	cancel    context.CancelFunc // for quit command
-	highlight *highlightState
-	theme     *style.Stylesheet
+	tabs        *editor.TabManager
+	textArea    *widgets.TextArea
+	fileTree    *widgets.DirectoryTree
+	treeRoot    string
+	tabBar      *tabBar
+	breadcrumbs *widgets.Breadcrumb
+	status      *state.Signal[string]
+	palette     *widgets.CommandPalette
+	search      *widgets.SearchWidget
+	replaceW    *replaceWidget
+	gotoLineW   *gotoLineWidget
+	fileFinder  *fileFinderWidget
+	cancel      context.CancelFunc // for quit command
+	highlight   *highlightState
+	theme       *style.Stylesheet
 
 	// Sidebar toggle
 	sidebarVisible bool
@@ -220,13 +243,41 @@ type maneApp struct {
 	slot           *contentSlot
 
 	// Search state
-	searchMatches    []editor.Range
-	searchCurrent    int
+	searchMatches     []editor.Range
+	searchCurrent     int
 	syntaxHighlights  []widgets.TextAreaHighlight // cached syntax highlights
 	bracketHighlights []widgets.TextAreaHighlight // bracket match highlights
+	multiCursor       *editor.MultiCursor
+	multiHighlights   []widgets.TextAreaHighlight // cached multi-cursor highlights
+
+	// File finder cache.
+	finderRoot string
+	finderPath []finderFile
+
+	// Git branch cache.
+	gitBranchPath  string
+	gitBranchCache string
 
 	// Auto-indent state
 	suppressChange bool
+
+	// View state.
+	wordWrap       bool
+	foldState      *editor.FoldState
+	blockSelection *editor.BlockSelection
+
+	// LSP integration.
+	lspClients     map[string]*lsp.Client
+	lspDocVersions map[string]int
+	lspServers     map[string]lsp.ServerConfig
+	lspDiagnostics map[string][]lsp.Diagnostic
+	diagnostics    []widgets.TextAreaHighlight // cached LSP diagnostics highlights
+	lspPalette     *widgets.CommandPalette     // reused for completion/references/code-action UI
+	renameW        *renameWidget               // rename symbol overlay
+
+	lspCtx    context.Context
+	lspCancel context.CancelFunc
+	lspMu     sync.Mutex
 }
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
@@ -236,7 +287,16 @@ func newManeApp(treeRoot string) *maneApp {
 		textArea:       widgets.NewTextArea(),
 		status:         state.NewSignal[string](" untitled"),
 		highlight:      newHighlightState(),
+		multiCursor:    editor.NewMultiCursor(),
+		treeRoot:       treeRoot,
 		sidebarVisible: true,
+		lspClients:     make(map[string]*lsp.Client),
+		lspDocVersions: make(map[string]int),
+		lspServers:     lsp.DefaultServers(),
+		lspDiagnostics: make(map[string][]lsp.Diagnostic),
+		wordWrap:       false,
+		foldState:      editor.NewFoldState(),
+		blockSelection: editor.NewBlockSelection(),
 	}
 
 	app.tabBar = newTabBar()
@@ -244,14 +304,25 @@ func newManeApp(treeRoot string) *maneApp {
 		app.switchTab(index)
 	}
 
+	app.breadcrumbs = widgets.NewBreadcrumb()
+	app.breadcrumbs.SetOnNavigate(func(index int) {
+		// Keep navigation in sync with breadcrumb click actions.
+		if index >= 0 && index < len(app.breadcrumbs.Items) {
+			if item := app.breadcrumbs.Items[index]; item.OnClick != nil {
+				item.OnClick()
+			}
+		}
+	})
+
 	app.textArea.SetLabel("Editor")
 	app.textArea.SetShowLineNumbers(true)
 	app.textArea.SetTabMode(true) // literal tabs for code editing
+	app.textArea.SetWordWrap(app.wordWrap)
 
 	app.fileTree = widgets.NewDirectoryTree(treeRoot,
 		widgets.WithLazyLoad(true),
 		widgets.WithOnSelect(func(path string) {
-			app.openFile(path)
+			_ = app.openFile(path)
 		}),
 	)
 
@@ -298,11 +369,14 @@ func newManeApp(treeRoot string) *maneApp {
 		}
 
 		// Debounced re-highlight on text change.
+		app.syncMultiCursorFromTextArea()
 		app.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 			app.applyHighlights(text, ranges)
 		})
 
+		app.scheduleLspDidChange(buf, text)
 		app.updateBracketMatch()
+		app.mergeAllHighlights()
 	})
 
 	return app
@@ -326,12 +400,230 @@ func byteOffsetToRuneOffset(text string) []int {
 	return mapping
 }
 
+func fileURI(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	uriPath := filepath.ToSlash(abs)
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	u := &url.URL{
+		Scheme: "file",
+		Path:   uriPath,
+	}
+	return u.String()
+}
+
+func languageIDFromPath(path string) string {
+	entry := grammars.DetectLanguage(filepath.Base(path))
+	if entry == nil {
+		return ""
+	}
+	return strings.ToLower(entry.Name)
+}
+
+func filePathFromURI(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	if u.Scheme != "file" {
+		return uri
+	}
+	path := u.Path
+	if path == "" {
+		return ""
+	}
+	path, err = url.PathUnescape(path)
+	if err != nil {
+		path = u.Path
+	}
+	if strings.HasPrefix(path, "/") && len(path) >= 3 && path[2] == ':' {
+		path = path[1:]
+	}
+	return filepath.FromSlash(path)
+}
+
+// lspOffsetFromPosition converts an LSP position to a byte offset.
+func lspOffsetFromPosition(text string, pos lsp.Position) int {
+	lines := strings.Split(text, "\n")
+	lineIdx := pos.Line
+	if lineIdx < 0 {
+		return 0
+	}
+	if lineIdx >= len(lines) {
+		return len(text)
+	}
+	runeCol := pos.Character
+	if runeCol < 0 {
+		runeCol = 0
+	}
+	lineText := []rune(lines[lineIdx])
+	if runeCol > len(lineText) {
+		runeCol = len(lineText)
+	}
+	colBytes := len(string(lineText[:runeCol]))
+
+	prefixLen := 0
+	for i := 0; i < lineIdx; i++ {
+		prefixLen += len(lines[i]) + 1
+	}
+	offset := prefixLen + colBytes
+	if offset > len(text) {
+		return len(text)
+	}
+	return offset
+}
+
+// runeOffsetToByteOffset converts a rune offset to a byte offset.
+func runeOffsetToByteOffset(text string, runeOffset int) int {
+	if runeOffset <= 0 {
+		return 0
+	}
+	total := utf8.RuneCountInString(text)
+	if runeOffset >= total {
+		return len(text)
+	}
+	runeIndex := 0
+	for byteIndex := range text {
+		if runeIndex == runeOffset {
+			return byteIndex
+		}
+		runeIndex++
+	}
+	return len(text)
+}
+
+// lspPositionFromByteOffset converts a byte offset to an LSP position.
+func lspPositionFromByteOffset(text string, byteOffset int) lsp.Position {
+	if byteOffset <= 0 {
+		return lsp.Position{}
+	}
+	if byteOffset > len(text) {
+		byteOffset = len(text)
+	}
+	prefix := text[:byteOffset]
+	line := strings.Count(prefix, "\n")
+	lineStart := strings.LastIndex(prefix, "\n")
+	if lineStart < 0 {
+		lineStart = 0
+	} else {
+		lineStart++
+	}
+	return lsp.Position{
+		Line:      line,
+		Character: utf8.RuneCountInString(prefix[lineStart:byteOffset]),
+	}
+}
+
+func lspRangeToByteOffsets(text string, rng lsp.Range) (int, int) {
+	start := lspOffsetFromPosition(text, rng.Start)
+	end := lspOffsetFromPosition(text, rng.End)
+	if end < start {
+		end = start
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > len(text) {
+		start = len(text)
+	}
+	if end > len(text) {
+		end = len(text)
+	}
+	return start, end
+}
+
+func (a *maneApp) activeLSPSession() (*editor.Buffer, string, string, *lsp.Client, error) {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return nil, "", "", nil, fmt.Errorf("no active buffer")
+	}
+	if buf.Path() == "" {
+		return nil, "", "", nil, fmt.Errorf("buffer has no file path")
+	}
+	uri := fileURI(buf.Path())
+	if uri == "" {
+		return nil, "", "", nil, fmt.Errorf("cannot build LSP URI")
+	}
+	langID := languageIDFromPath(buf.Path())
+	if langID == "" {
+		return nil, "", "", nil, fmt.Errorf("no language server mapping for %s", filepath.Base(buf.Path()))
+	}
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	return buf, uri, langID, client, nil
+}
+
+func (a *maneApp) activeCursorPosition(buf *editor.Buffer) (lsp.Position, error) {
+	if buf == nil {
+		return lsp.Position{}, fmt.Errorf("no active buffer")
+	}
+	text := buf.Text()
+	cursorOffset := a.textArea.CursorOffset()
+	byteOffset := runeOffsetToByteOffset(text, cursorOffset)
+	return lspPositionFromByteOffset(text, byteOffset), nil
+}
+
+func (a *maneApp) setCursorFromLSPPosition(uri string, pos lsp.Position) error {
+	path := filePathFromURI(uri)
+	if path != "" && (a.tabs.ActiveBuffer() == nil || a.tabs.ActiveBuffer().Path() != path) {
+		if _, err := a.tabs.OpenFile(path); err == nil {
+			a.syncTextArea()
+			a.syncTabBar()
+			a.syncBreadcrumbs()
+			a.highlight.setup(filepath.Base(path))
+			a.openLSPDocument(a.tabs.ActiveBuffer())
+			text := a.tabs.ActiveBuffer().Text()
+			a.applyHighlights(text, a.highlight.highlight([]byte(text)))
+		} else {
+			return err
+		}
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return fmt.Errorf("no active buffer")
+	}
+	text := buf.Text()
+	byteOffset := lspOffsetFromPosition(text, pos)
+	mapping := byteOffsetToRuneOffset(text)
+	runeOffset := mapping[byteOffset]
+	a.textArea.SetCursorOffset(runeOffset)
+	a.updateStatus()
+	return nil
+}
+
+func (a *maneApp) lspDiagnosticsForActive() []lsp.Diagnostic {
+	uri := ""
+	if buf := a.tabs.ActiveBuffer(); buf != nil {
+		uri = fileURI(buf.Path())
+	}
+	if uri == "" {
+		return nil
+	}
+	a.lspMu.Lock()
+	defer a.lspMu.Unlock()
+	out := make([]lsp.Diagnostic, 0, len(a.lspDiagnostics[uri]))
+	out = append(out, a.lspDiagnostics[uri]...)
+	return out
+}
+
 // applyHighlights converts gotreesitter.HighlightRange values to TextAreaHighlight
 // and sets them on the TextArea.
 func (a *maneApp) applyHighlights(text string, ranges []gotreesitter.HighlightRange) {
-	if a.theme == nil || len(ranges) == 0 {
+	if len(ranges) == 0 || a.theme == nil {
 		a.syntaxHighlights = nil
-		a.textArea.ClearHighlights()
+		a.mergeAllHighlights()
 		return
 	}
 
@@ -363,16 +655,16 @@ func (a *maneApp) applyHighlights(text string, ranges []gotreesitter.HighlightRa
 
 	// Cache syntax highlights for merging with search highlights
 	a.syntaxHighlights = highlights
-	a.textArea.SetHighlights(highlights)
+	a.mergeAllHighlights()
 }
 
 // openFile opens a file by path through the TabManager and loads its content
 // into the TextArea.
-func (a *maneApp) openFile(path string) {
+func (a *maneApp) openFile(path string) error {
 	_, err := a.tabs.OpenFile(path)
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" error: %v", err))
-		return
+		return err
 	}
 
 	// Set up syntax highlighting for the file's language.
@@ -380,15 +672,20 @@ func (a *maneApp) openFile(path string) {
 
 	a.syncTextArea()
 	a.syncTabBar()
+	a.syncBreadcrumbs()
 	a.updateStatus()
 
-	// Run initial highlight and apply to TextArea.
 	buf := a.tabs.ActiveBuffer()
 	if buf != nil {
 		text := buf.Text()
 		ranges := a.highlight.highlight([]byte(text))
 		a.applyHighlights(text, ranges)
+		a.openLSPDocument(buf)
+		a.applyDiagnosticsForActiveBuffer()
+		a.updateFoldRegions()
+		a.updateStatus()
 	}
+	return nil
 }
 
 // syncTextArea loads the active buffer's text into the TextArea widget.
@@ -396,9 +693,200 @@ func (a *maneApp) syncTextArea() {
 	buf := a.tabs.ActiveBuffer()
 	if buf == nil {
 		a.textArea.SetText("")
+		a.bracketHighlights = nil
+		a.multiHighlights = nil
+		if a.multiCursor == nil {
+			a.multiCursor = editor.NewMultiCursor()
+		} else {
+			a.multiCursor.Reset()
+		}
+		a.applyDiagnosticsForActiveBuffer()
 		return
 	}
 	a.textArea.SetText(buf.Text())
+	a.syncMultiCursorFromTextArea()
+	a.applyDiagnosticsForActiveBuffer()
+}
+
+func clampRuneOffset(offset int, max int) int {
+	if offset < 0 {
+		return 0
+	}
+	if offset > max {
+		return max
+	}
+	return offset
+}
+
+func (a *maneApp) isMultiCursorMode() bool {
+	return a.multiCursor != nil && a.multiCursor.IsMulti()
+}
+
+func (a *maneApp) syncMultiCursorFromTextArea() {
+	if a.multiCursor == nil {
+		a.multiCursor = editor.NewMultiCursor()
+	}
+
+	text := a.textArea.Text()
+	textLen := utf8.RuneCountInString(text)
+	sel := a.textArea.GetSelection()
+
+	a.multiCursor.Reset()
+	a.multiCursor.SetPrimary(clampRuneOffset(a.textArea.CursorOffset(), textLen), clampRuneOffset(sel.Start, textLen))
+	a.syncMultiHighlights()
+}
+
+func (a *maneApp) resetMultiCursor() {
+	a.syncMultiCursorFromTextArea()
+	a.updateStatus()
+	a.mergeAllHighlights()
+}
+
+func (a *maneApp) syncTextAreaFromMultiCursor() {
+	if a.multiCursor == nil {
+		return
+	}
+	primary := a.multiCursor.Primary()
+	textLen := utf8.RuneCountInString(a.textArea.Text())
+	a.textArea.SetCursorOffset(clampRuneOffset(primary.Offset, textLen))
+	a.textArea.SetSelection(widgets.Selection{
+		Start: clampRuneOffset(primary.Anchor, textLen),
+		End:   clampRuneOffset(primary.Offset, textLen),
+	})
+	a.syncMultiHighlights()
+}
+
+func (a *maneApp) applyMultiCursorText(newText string) {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	buf.SetText(newText)
+	a.suppressChange = true
+	a.textArea.SetText(newText)
+	a.suppressChange = false
+	a.syncTextAreaFromMultiCursor()
+	a.rehighlight(newText)
+	a.scheduleLspDidChange(buf, newText)
+	a.updateBracketMatch()
+	a.updateStatus()
+}
+
+func (a *maneApp) applyMultiCursorInsert(text string) {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	if !a.isMultiCursorMode() {
+		a.syncMultiCursorFromTextArea()
+	}
+
+	newText := a.multiCursor.InsertAtAll(buf.Text(), text)
+	a.applyMultiCursorText(newText)
+}
+
+func (a *maneApp) applyPaste(text string) {
+	if text == "" {
+		return
+	}
+	if a.isMultiCursorMode() {
+		a.applyMultiCursorInsert(text)
+		return
+	}
+	a.textArea.ClipboardPaste(text)
+}
+
+func (a *maneApp) clipboardText() string {
+	cb := clipboard.NewAutoClipboard(os.Stdout)
+	if cb == nil || !cb.Available() {
+		return ""
+	}
+	text, err := cb.Read()
+	if err != nil || text == "" {
+		return ""
+	}
+	return text
+}
+
+func (a *maneApp) applyMultiCursorDeleteBackspace() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	newText := a.multiCursor.DeleteBackspace(buf.Text())
+	a.applyMultiCursorText(newText)
+}
+
+func (a *maneApp) applyMultiCursorDeleteForward() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	newText := a.multiCursor.DeleteForward(buf.Text())
+	a.applyMultiCursorText(newText)
+}
+
+func (a *maneApp) addNextCursorOccurrence() {
+	if a.multiCursor == nil {
+		a.multiCursor = editor.NewMultiCursor()
+	}
+	if !a.isMultiCursorMode() {
+		a.syncMultiCursorFromTextArea()
+	}
+
+	if !a.multiCursor.AddNextOccurrence(a.textArea.Text()) {
+		a.status.Set(" no further occurrences")
+		return
+	}
+
+	a.syncTextAreaFromMultiCursor()
+	a.updateStatus()
+	a.mergeAllHighlights()
+}
+
+func (a *maneApp) syncMultiHighlights() {
+	if a.multiCursor == nil || !a.isMultiCursorMode() {
+		a.multiHighlights = nil
+		return
+	}
+
+	textLen := utf8.RuneCountInString(a.textArea.Text())
+	otherStyle := backend.DefaultStyle().Background(backend.ColorRGB(0x00, 0x5f, 0x87))
+
+	highlights := make([]widgets.TextAreaHighlight, 0, a.multiCursor.Count())
+	for i, c := range a.multiCursor.Cursors() {
+		if i == 0 {
+			continue
+		}
+
+		start := c.Anchor
+		end := c.Offset
+		if start > end {
+			start, end = end, start
+		}
+		start = clampRuneOffset(start, textLen)
+		end = clampRuneOffset(end, textLen)
+		if start > end {
+			start, end = end, start
+		}
+		if end == start {
+			if start < textLen {
+				end = start + 1
+			} else if start > 0 {
+				start = start - 1
+				end = start + 1
+			} else {
+				continue
+			}
+		}
+		highlights = append(highlights, widgets.TextAreaHighlight{
+			Start: start,
+			End:   end,
+			Style: otherStyle,
+		})
+	}
+	a.multiHighlights = highlights
 }
 
 // updateStatus refreshes the status bar signal with the current buffer info.
@@ -421,8 +909,202 @@ func (a *maneApp) updateStatus() {
 		langName = "  " + strings.ToUpper(entry.Name)
 	}
 
+	// Extra editor metadata.
+	encoding := " UTF-8"
+	lineEnding := detectLineEnding(buf.Text())
+	indent := detectIndentMode(buf.Text())
+	selectionCount := a.selectionCount()
+	branch := a.currentGitBranch(buf.Path())
+	wrap := "off"
+	if a.wordWrap {
+		wrap = "on"
+	}
+
 	col, row := a.textArea.CursorPosition()
-	a.status.Set(fmt.Sprintf(" %s%s%s  Ln %d, Col %d", buf.Title(), dirty, langName, row+1, col+1))
+	status := fmt.Sprintf(
+		" %s%s%s  Ln %d, Col %d  %s  %s  %s",
+		buf.Title(),
+		dirty,
+		langName,
+		row+1,
+		col+1,
+		encoding,
+		lineEnding,
+		indent,
+	)
+	status += fmt.Sprintf("  wrap:%s", wrap)
+	if branch != "" {
+		status += "  " + branch
+	}
+	if selectionCount > 0 {
+		status += fmt.Sprintf("  Sel %d", selectionCount)
+		if a.isMultiCursorMode() {
+			status += fmt.Sprintf(" (%d cursors)", a.multiCursor.Count())
+		}
+	}
+	if diagSummary := a.diagnosticSummary(); diagSummary != "" {
+		status += "  " + diagSummary
+	}
+	a.status.Set(status)
+}
+
+// selectionCount returns the currently selected rune count in the editor.
+func (a *maneApp) selectionCount() int {
+	type interval struct {
+		Start int
+		End   int
+	}
+
+	var cursors []editor.Cursor
+	if a.multiCursor != nil && a.multiCursor.IsMulti() {
+		cursors = a.multiCursor.Cursors()
+	} else {
+		sel := a.textArea.GetSelection()
+		cursors = []editor.Cursor{{Offset: a.textArea.CursorOffset(), Anchor: sel.Start}}
+	}
+
+	textLen := utf8.RuneCountInString(a.textArea.Text())
+	ranges := make([]interval, 0, len(cursors))
+
+	for _, c := range cursors {
+		start := c.Offset
+		end := c.Anchor
+		if start > end {
+			start, end = end, start
+		}
+		start = clampRuneOffset(start, textLen)
+		end = clampRuneOffset(end, textLen)
+		if start == end {
+			continue
+		}
+		ranges = append(ranges, interval{Start: start, End: end})
+	}
+
+	if len(ranges) == 0 {
+		return 0
+	}
+
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Start == ranges[j].Start {
+			return ranges[i].End < ranges[j].End
+		}
+		return ranges[i].Start < ranges[j].Start
+	})
+
+	merged := make([]interval, 0, len(ranges))
+	for _, r := range ranges {
+		if len(merged) == 0 {
+			merged = append(merged, r)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if r.Start > last.End {
+			merged = append(merged, r)
+			continue
+		}
+		if r.End > last.End {
+			last.End = r.End
+		}
+	}
+
+	total := 0
+	for _, r := range merged {
+		total += r.End - r.Start
+	}
+	return total
+}
+
+// syncBreadcrumbs rebuilds breadcrumb links from the active file path.
+func (a *maneApp) syncBreadcrumbs() {
+	if a.breadcrumbs == nil {
+		return
+	}
+
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil || buf.Path() == "" {
+		a.breadcrumbs.Items = nil
+		return
+	}
+
+	clean := filepath.Clean(buf.Path())
+	separator := string(filepath.Separator)
+	parts := strings.Split(clean, separator)
+
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			normalized = append(normalized, part)
+		}
+	}
+
+	if len(normalized) == 0 && !filepath.IsAbs(clean) {
+		a.breadcrumbs.Items = nil
+		return
+	}
+
+	// Build up visible path segments from root.
+	items := make([]widgets.BreadcrumbItem, 0, len(normalized)+1)
+
+	cursor := ""
+	if filepath.IsAbs(clean) {
+		vol := filepath.VolumeName(clean)
+		if vol != "" {
+			cursor = vol + separator
+		} else {
+			cursor = separator
+		}
+		rootPath := cursor
+		items = append(items, widgets.BreadcrumbItem{
+			Label: rootPath,
+			OnClick: func(path string) func() {
+				return func() {
+					a.fileTree.SetRoot(path)
+				}
+			}(rootPath),
+		})
+		if vol != "" && len(normalized) > 0 && normalized[0] == vol {
+			normalized = normalized[1:]
+		}
+	}
+
+	for i, part := range normalized {
+		if cursor == "" {
+			cursor = part
+		} else {
+			cursor = filepath.Join(cursor, part)
+		}
+
+		path := cursor
+		isFile := i == len(normalized)-1
+		item := widgets.BreadcrumbItem{
+			Label: part,
+			OnClick: func(p string, dir bool) func() {
+				return func() {
+					if dir {
+						a.fileTree.SetRoot(p)
+						return
+					}
+					a.fileTree.SetRoot(filepath.Dir(p))
+				}
+			}(path, !isFile),
+		}
+		items = append(items, item)
+	}
+
+	if len(items) == 0 {
+		// Path is filesystem root.
+		rootPath := cursor
+		items = append(items, widgets.BreadcrumbItem{
+			Label: rootPath,
+			OnClick: func(path string) func() {
+				return func() {
+					a.fileTree.SetRoot(path)
+				}
+			}(rootPath),
+		})
+	}
+
+	a.breadcrumbs.Items = items
 }
 
 // toggleSidebar shows or hides the file tree sidebar.
@@ -470,6 +1152,58 @@ func (a *maneApp) onSearch(query string) {
 	}
 
 	a.applySearchHighlights()
+}
+
+// fileFinderRoot returns the active tree root used for file searching.
+func (a *maneApp) fileFinderRoot() string {
+	if a.fileTree != nil {
+		if root := a.fileTree.Root(); root != "" {
+			return root
+		}
+	}
+	return a.treeRoot
+}
+
+// cmdOpenFileFinder opens the fuzzy file finder overlay.
+func (a *maneApp) cmdOpenFileFinder() runtime.HandleResult {
+	if a.fileFinder == nil {
+		return runtime.Handled()
+	}
+	root := a.fileFinderRoot()
+	if root == "" {
+		return runtime.Handled()
+	}
+
+	if a.finderRoot != root || len(a.finderPath) == 0 {
+		items, err := collectFinderFiles(root)
+		if err != nil {
+			a.status.Set(fmt.Sprintf(" file finder error: %v", err))
+			return runtime.Handled()
+		}
+		a.finderRoot = root
+		a.finderPath = items
+	}
+
+	a.fileFinder.SetFiles(a.finderPath)
+	a.fileFinder.Show()
+	a.fileFinder.Focus()
+	return runtime.Handled()
+}
+
+func (a *maneApp) onFileFinder(path string) {
+	if path == "" {
+		return
+	}
+	_ = a.openFile(path)
+}
+
+func (a *maneApp) onFileFinderClose() {
+	// Keep status behavior unchanged when the finder is dismissed.
+}
+
+// cmdShowPalette opens the command palette.
+func (a *maneApp) cmdShowPalette() {
+	a.palette.Toggle()
 }
 
 // onSearchNext moves to the next search match.
@@ -647,6 +1381,72 @@ func (a *maneApp) onReplaceClose() {
 	a.textArea.SetHighlights(a.syntaxHighlights)
 }
 
+// cmdGotoLine opens the go-to-line input overlay.
+func (a *maneApp) cmdGotoLine() runtime.HandleResult {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return runtime.Unhandled()
+	}
+	_, row := a.textArea.CursorPosition()
+	a.gotoLineW.SetQuery(strconv.Itoa(row + 1))
+	a.gotoLineW.Focus()
+	return runtime.WithCommand(runtime.PushOverlay{Widget: a.gotoLineW})
+}
+
+// onGotoLine handles the submitted line number from the go-to-line widget.
+func (a *maneApp) onGotoLine(line int) {
+	if line <= 0 {
+		a.status.Set(" Invalid line number")
+		return
+	}
+
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	maxLine := editor.LineCount(buf.Text())
+	if maxLine == 0 {
+		maxLine = 1
+	}
+	if line > maxLine {
+		line = maxLine
+	}
+
+	a.textArea.SetCursorPosition(0, line-1)
+	a.updateStatus()
+}
+
+func (a *maneApp) onGotoLineClose() {
+	// Keep status behavior unchanged when the overlay is dismissed.
+}
+
+func (a *maneApp) currentGitBranch(path string) string {
+	if path == "" {
+		return ""
+	}
+	if a.gitBranchPath == path && a.gitBranchCache != "" {
+		return a.gitBranchCache
+	}
+	a.gitBranchPath = path
+	a.gitBranchCache = detectGitBranch(path)
+	return a.gitBranchCache
+}
+
+// cmdGotoMatchingBracket jumps the cursor to the matching bracket if one is
+// nearby the cursor position.
+func (a *maneApp) cmdGotoMatchingBracket() {
+	text := a.textArea.Text()
+	offset := a.textArea.CursorOffset()
+	for _, pos := range []int{offset, offset - 1} {
+		if match, ok := editor.FindMatchingBracket(text, pos); ok {
+			a.textArea.SetCursorOffset(match)
+			a.updateStatus()
+			return
+		}
+	}
+}
+
 // jumpToMatch moves the cursor to the given match index.
 func (a *maneApp) jumpToMatch(idx int) {
 	if idx < 0 || idx >= len(a.searchMatches) {
@@ -662,6 +1462,536 @@ func (a *maneApp) jumpToMatch(idx int) {
 // applySearchHighlights merges syntax highlights with search match highlights.
 func (a *maneApp) applySearchHighlights() {
 	a.mergeAllHighlights()
+}
+
+func (a *maneApp) showLSPPalette(commands []widgets.PaletteCommand, status string) {
+	if len(commands) == 0 {
+		a.lspPalette.Hide()
+		a.status.Set(" " + status)
+		return
+	}
+	a.lspPalette.SetCommands(commands)
+	a.lspPalette.Show()
+	a.lspPalette.Focus()
+	a.status.Set(" " + status)
+}
+
+func (a *maneApp) cmdLspComplete() {
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+
+	items, err := client.Completion(a.lspCtx, uri, pos)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" completion failed: %v", err))
+		return
+	}
+	if len(items) == 0 {
+		a.status.Set(" no completion suggestions")
+		return
+	}
+
+	cmds := make([]widgets.PaletteCommand, 0, len(items))
+	for i, item := range items {
+		insert := item.InsertText
+		if insert == "" {
+			insert = item.Label
+		}
+		if insert == "" {
+			continue
+		}
+		description := item.Detail
+		if description == "" {
+			description = item.Documentation
+		}
+		itemCopy := item
+		cmds = append(cmds, widgets.PaletteCommand{
+			ID:          fmt.Sprintf("lsp.complete.%d", i),
+			Label:       item.Label,
+			Description: description,
+			OnExecute: func(item lsp.CompletionItem) func() {
+				return func() {
+					a.applyLSPCompletion(item)
+					a.lspPalette.Hide()
+				}
+			}(itemCopy),
+		})
+	}
+	if len(cmds) == 0 {
+		a.status.Set(" no completion suggestions")
+		return
+	}
+	a.showLSPPalette(cmds, fmt.Sprintf("Completion: %d items", len(cmds)))
+}
+
+func (a *maneApp) applyLSPCompletion(item lsp.CompletionItem) {
+	insert := item.InsertText
+	if insert == "" {
+		insert = item.Label
+	}
+	if insert == "" {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	text := buf.Text()
+	offsetRunes := a.textArea.CursorOffset()
+	offsetBytes := runeOffsetToByteOffset(text, offsetRunes)
+	newText := text[:offsetBytes] + insert + text[offsetBytes:]
+
+	a.suppressChange = true
+	buf.SetText(newText)
+	a.textArea.SetText(newText)
+	a.suppressChange = false
+	a.textArea.SetCursorOffset(offsetRunes + utf8.RuneCountInString(insert))
+	a.textArea.SetSelection(widgets.Selection{})
+	a.syncMultiCursorFromTextArea()
+	a.rehighlight(newText)
+	a.scheduleLspDidChange(buf, newText)
+	a.applyDiagnosticsForActiveBuffer()
+	a.status.Set(fmt.Sprintf(" inserted: %s", item.Label))
+	a.updateStatus()
+}
+
+func (a *maneApp) cmdLspDefinition() {
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+
+	locations, err := client.Definition(a.lspCtx, uri, pos)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" definition lookup failed: %v", err))
+		return
+	}
+	if len(locations) == 0 {
+		a.status.Set(" no definition")
+		return
+	}
+
+	if err := a.openLSPLocation(locations[0].URI, locations[0].Range.Start); err != nil {
+		a.status.Set(fmt.Sprintf(" definition failed: %v", err))
+		return
+	}
+}
+
+func (a *maneApp) cmdLspReferences() {
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+
+	locations, err := client.References(a.lspCtx, uri, pos)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" references lookup failed: %v", err))
+		return
+	}
+	if len(locations) == 0 {
+		a.status.Set(" no references")
+		return
+	}
+
+	cmds := make([]widgets.PaletteCommand, 0, len(locations))
+	for i, loc := range locations {
+		path := filePathFromURI(loc.URI)
+		displayPath := path
+		if path == "" {
+			displayPath = loc.URI
+		}
+		title := fmt.Sprintf("%s:%d:%d", filepath.Base(displayPath), loc.Range.Start.Line+1, loc.Range.Start.Character+1)
+		cmds = append(cmds, widgets.PaletteCommand{
+			ID:          fmt.Sprintf("lsp.ref.%d", i),
+			Label:       title,
+			Description: displayPath,
+			OnExecute: func(uri string, pos lsp.Position) func() {
+				return func() {
+					if err := a.openLSPLocation(uri, pos); err != nil {
+						a.status.Set(fmt.Sprintf(" reference open failed: %v", err))
+					}
+				}
+			}(loc.URI, loc.Range.Start),
+		})
+	}
+
+	a.showLSPPalette(cmds, fmt.Sprintf("References: %d", len(cmds)))
+}
+
+func (a *maneApp) cmdLspHover() {
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	hover, err := client.HoverInfo(a.lspCtx, uri, pos)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" hover failed: %v", err))
+		return
+	}
+	if hover == nil {
+		a.status.Set(" no hover info")
+		return
+	}
+	content := extractHoverText(hover.Contents)
+	if content == "" {
+		a.status.Set(" no hover info")
+		return
+	}
+	if len(content) > 160 {
+		content = content[:157] + "..."
+	}
+	a.status.Set(" " + content)
+}
+
+func (a *maneApp) cmdLspCodeAction() {
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	diags := a.lspDiagnosticsForActive()
+	actions, err := client.CodeAction(a.lspCtx, uri, lsp.Range{Start: pos, End: pos}, diags)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" code action failed: %v", err))
+		return
+	}
+	if len(actions) == 0 {
+		a.status.Set(" no code actions")
+		return
+	}
+
+	cmds := make([]widgets.PaletteCommand, 0, len(actions))
+	for i, action := range actions {
+		title := action.Title
+		if title == "" {
+			title = "Code Action"
+		}
+		actionCopy := action
+		cmds = append(cmds, widgets.PaletteCommand{
+			ID:    fmt.Sprintf("lsp.action.%d", i),
+			Label: title,
+			OnExecute: func(action lsp.CodeAction) func() {
+				return func() {
+					if action.Edit == nil || len(action.Edit.Changes) == 0 {
+						a.status.Set(" selected code action has no edits")
+						return
+					}
+					if err := a.applyWorkspaceEdits(action.Edit.Changes); err != nil {
+						a.status.Set(fmt.Sprintf(" apply code action failed: %v", err))
+					} else {
+						a.status.Set(" applied code action")
+					}
+				}
+			}(actionCopy),
+		})
+	}
+	a.showLSPPalette(cmds, fmt.Sprintf("Code actions: %d", len(cmds)))
+}
+
+func (a *maneApp) cmdLspRename() runtime.HandleResult {
+	if _, _, _, _, err := a.activeLSPSession(); err != nil {
+		a.status.Set(" " + err.Error())
+		return runtime.Handled()
+	}
+	a.renameW.SetText(a.currentSymbolAtCursor())
+	a.renameW.Focus()
+	return runtime.WithCommand(runtime.PushOverlay{Widget: a.renameW})
+}
+
+func (a *maneApp) cmdRenameSubmit(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		a.status.Set(" rename cancelled")
+		return
+	}
+	buf, uri, _, client, err := a.activeLSPSession()
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		a.status.Set(" " + err.Error())
+		return
+	}
+
+	changes, err := client.Rename(a.lspCtx, uri, pos, name)
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" rename failed: %v", err))
+		return
+	}
+	if err := a.applyWorkspaceEdits(changes); err != nil {
+		a.status.Set(fmt.Sprintf(" rename failed: %v", err))
+		return
+	}
+	a.status.Set(fmt.Sprintf(" renamed to %q", name))
+	a.updateStatus()
+}
+
+func (a *maneApp) openLSPLocation(uri string, pos lsp.Position) error {
+	path := filePathFromURI(uri)
+	if path == "" {
+		return fmt.Errorf("invalid URI: %s", uri)
+	}
+	if err := a.openFile(path); err != nil {
+		return err
+	}
+	return a.setCursorFromLSPPosition(uri, pos)
+}
+
+func (a *maneApp) findBufferByPath(path string) *editor.Buffer {
+	if path == "" {
+		return nil
+	}
+	normalized, err := filepath.Abs(path)
+	if err != nil {
+		normalized = filepath.Clean(path)
+	}
+
+	for _, buf := range a.tabs.Buffers() {
+		if buf == nil || buf.Path() == "" {
+			continue
+		}
+		bufferPath, err := filepath.Abs(buf.Path())
+		if err != nil {
+			bufferPath = filepath.Clean(buf.Path())
+		}
+		if filepath.Clean(bufferPath) == filepath.Clean(normalized) {
+			return buf
+		}
+	}
+	return nil
+}
+
+func (a *maneApp) restoreActiveBuffer(index int, cursorOffset int) {
+	count := a.tabs.Count()
+	if count == 0 {
+		a.syncTextArea()
+		a.syncTabBar()
+		a.syncBreadcrumbs()
+		a.applyDiagnosticsForActiveBuffer()
+		return
+	}
+	if index < 0 {
+		return
+	}
+	if index >= count {
+		index = count - 1
+	}
+	a.tabs.SetActive(index)
+	a.syncTextArea()
+	a.syncTabBar()
+	a.syncBreadcrumbs()
+	maxOffset := utf8.RuneCountInString(a.textArea.Text())
+	if cursorOffset < 0 {
+		cursorOffset = 0
+	}
+	if cursorOffset > maxOffset {
+		cursorOffset = maxOffset
+	}
+	a.textArea.SetCursorOffset(cursorOffset)
+	a.syncMultiCursorFromTextArea()
+	a.applyDiagnosticsForActiveBuffer()
+	a.updateStatus()
+}
+
+func (a *maneApp) applyWorkspaceEdits(changes map[string][]lsp.TextEdit) error {
+	if len(changes) == 0 {
+		return fmt.Errorf("no edits to apply")
+	}
+
+	originalActiveIndex := a.tabs.Active()
+	originalBuffer := a.tabs.ActiveBuffer()
+	originalCursorOffset := 0
+	if active := a.tabs.ActiveBuffer(); active != nil {
+		originalCursorOffset = a.textArea.CursorOffset()
+	}
+
+	changed := false
+	skipped := 0
+	editedBuffers := 0
+
+	for uri, edits := range changes {
+		if len(edits) == 0 {
+			continue
+		}
+
+		path := filePathFromURI(uri)
+		if path == "" {
+			skipped++
+			continue
+		}
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+
+		buf := a.findBufferByPath(path)
+		if buf == nil {
+			// Open non-active file to apply cross-file workspace edits.
+			if _, err := a.tabs.OpenFile(path); err != nil {
+				skipped++
+				continue
+			}
+			buf = a.tabs.ActiveBuffer()
+			if buf == nil {
+				skipped++
+				continue
+			}
+			a.openLSPDocument(buf)
+		}
+		if buf.Path() == "" {
+			skipped++
+			continue
+		}
+
+		text := buf.Text()
+		type replacement struct {
+			Start int
+			End   int
+			Text  string
+		}
+		ranges := make([]replacement, 0, len(edits))
+		for _, edit := range edits {
+			start, end := lspRangeToByteOffsets(text, edit.Range)
+			ranges = append(ranges, replacement{
+				Start: start,
+				End:   end,
+				Text:  edit.NewText,
+			})
+		}
+		sort.Slice(ranges, func(i, j int) bool {
+			if ranges[i].Start == ranges[j].Start {
+				return ranges[i].End > ranges[j].End
+			}
+			return ranges[i].Start > ranges[j].Start
+		})
+
+		newText := text
+		for _, r := range ranges {
+			if r.Start < 0 || r.End < r.Start || r.Start > len(newText) {
+				continue
+			}
+			if r.End > len(newText) {
+				r.End = len(newText)
+			}
+			newText = newText[:r.Start] + r.Text + newText[r.End:]
+		}
+
+		a.suppressChange = true
+		buf.SetText(newText)
+		a.suppressChange = false
+		a.scheduleLspDidChange(buf, newText)
+		if buf == originalBuffer {
+			a.textArea.SetText(newText)
+			a.syncMultiCursorFromTextArea()
+			a.rehighlight(newText)
+		}
+		changed = true
+		editedBuffers++
+	}
+
+	a.restoreActiveBuffer(originalActiveIndex, originalCursorOffset)
+
+	if !changed {
+		if skipped > 0 {
+			return fmt.Errorf("no edits applied (%d skipped)", skipped)
+		}
+		return fmt.Errorf("no edits to apply")
+	}
+	if skipped > 0 {
+		a.status.Set(fmt.Sprintf(" applied edits in %d file(s); %d file(s) skipped", editedBuffers, skipped))
+	}
+	return nil
+}
+
+func (a *maneApp) currentSymbolAtCursor() string {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return ""
+	}
+	text := []rune(buf.Text())
+	if len(text) == 0 {
+		return ""
+	}
+
+	offset := a.textArea.CursorOffset()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(text) {
+		offset = len(text) - 1
+	}
+	if offset < 0 {
+		return ""
+	}
+
+	isWord := func(r rune) bool {
+		return r == '_' || r == '$' || ('0' <= r && r <= '9') || ('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z')
+	}
+	if !isWord(text[offset]) {
+		return ""
+	}
+
+	start := offset
+	for start > 0 && isWord(text[start-1]) {
+		start--
+	}
+	end := offset + 1
+	for end < len(text) && isWord(text[end]) {
+		end++
+	}
+	return string(text[start:end])
+}
+
+func extractHoverText(contents interface{}) string {
+	switch v := contents.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]interface{}:
+		if value, ok := v["value"].(string); ok && value != "" {
+			return strings.TrimSpace(value)
+		}
+		if value, ok := v["kind"].(string); ok && value != "" {
+			return strings.TrimSpace(value)
+		}
+	case []interface{}:
+		for _, item := range v {
+			if text := extractHoverText(item); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 // updateBracketMatch updates bracket highlight state based on the current
@@ -694,12 +2024,14 @@ func (a *maneApp) updateBracketMatch() {
 	a.mergeAllHighlights()
 }
 
-// mergeAllHighlights combines all highlight layers (syntax, brackets, search)
+// mergeAllHighlights combines all highlight layers (syntax, brackets, diagnostics, search)
 // and sets the merged result on the TextArea.
 func (a *maneApp) mergeAllHighlights() {
 	var merged []widgets.TextAreaHighlight
 	merged = append(merged, a.syntaxHighlights...)
 	merged = append(merged, a.bracketHighlights...)
+	merged = append(merged, a.diagnostics...)
+	merged = append(merged, a.multiHighlights...)
 	// If search is active, add search highlights on top
 	if len(a.searchMatches) > 0 {
 		text := a.textArea.Text()
@@ -729,6 +2061,276 @@ func (a *maneApp) mergeAllHighlights() {
 	a.textArea.SetHighlights(merged)
 }
 
+func (a *maneApp) applyDiagnosticsForActiveBuffer() {
+	text := a.textArea.Text()
+	uri := ""
+	if buf := a.tabs.ActiveBuffer(); buf != nil {
+		uri = fileURI(buf.Path())
+	}
+	if uri == "" {
+		a.lspMu.Lock()
+		a.diagnostics = nil
+		a.lspMu.Unlock()
+		a.mergeAllHighlights()
+		return
+	}
+
+	a.lspMu.Lock()
+	diagnostics := append([]lsp.Diagnostic(nil), a.lspDiagnostics[uri]...)
+	a.lspMu.Unlock()
+
+	mapping := byteOffsetToRuneOffset(text)
+	rendered := make([]widgets.TextAreaHighlight, 0, len(diagnostics))
+	for _, diag := range diagnostics {
+		start := lspOffsetFromPosition(text, diag.Range.Start)
+		end := lspOffsetFromPosition(text, diag.Range.End)
+		if start < 0 {
+			start = 0
+		}
+		if end < start {
+			end = start
+		}
+		if start > len(text) {
+			start = len(text)
+		}
+		if end > len(text) {
+			end = len(text)
+		}
+
+		style := backend.DefaultStyle().Underline(true).Foreground(backend.ColorYellow)
+		if diag.Severity == 1 {
+			style = style.Foreground(backend.ColorRed)
+		} else if diag.Severity == 2 {
+			style = style.Foreground(backend.ColorYellow)
+		} else {
+			style = style.Foreground(backend.ColorCyan)
+		}
+		rendered = append(rendered, widgets.TextAreaHighlight{
+			Start: mapping[start],
+			End:   mapping[end],
+			Style: style,
+		})
+	}
+
+	a.lspMu.Lock()
+	a.diagnostics = rendered
+	a.lspMu.Unlock()
+	a.mergeAllHighlights()
+}
+
+func (a *maneApp) diagnosticSummary() string {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return ""
+	}
+	uri := fileURI(buf.Path())
+	if uri == "" {
+		return ""
+	}
+
+	a.lspMu.Lock()
+	diags := a.lspDiagnostics[uri]
+	a.lspMu.Unlock()
+
+	errorCount := 0
+	warningCount := 0
+	for _, d := range diags {
+		switch d.Severity {
+		case 1:
+			errorCount++
+		case 2:
+			warningCount++
+		}
+	}
+	if errorCount == 0 && warningCount == 0 {
+		return ""
+	}
+
+	if warningCount == 0 {
+		return fmt.Sprintf("Diag: %d errors", errorCount)
+	}
+	if errorCount == 0 {
+		return fmt.Sprintf("Diag: %d warnings", warningCount)
+	}
+	return fmt.Sprintf("Diag: %d errors, %d warnings", errorCount, warningCount)
+}
+
+func (a *maneApp) shutdownLSP() {
+	a.lspMu.Lock()
+	clients := make([]*lsp.Client, 0, len(a.lspClients))
+	for _, client := range a.lspClients {
+		clients = append(clients, client)
+	}
+	a.lspClients = make(map[string]*lsp.Client)
+	a.lspDocVersions = make(map[string]int)
+	a.lspDiagnostics = make(map[string][]lsp.Diagnostic)
+	a.lspMu.Unlock()
+
+	for _, client := range clients {
+		_ = client.Close()
+	}
+}
+
+func (a *maneApp) lspClientForLanguage(langID string) (*lsp.Client, error) {
+	if langID == "" {
+		return nil, fmt.Errorf("missing language id")
+	}
+	config, ok := a.lspServers[langID]
+	if !ok || config.Command == "" {
+		return nil, fmt.Errorf("no LSP server config for %s", langID)
+	}
+
+	a.lspMu.Lock()
+	existing := a.lspClients[langID]
+	a.lspMu.Unlock()
+	if existing != nil {
+		return existing, nil
+	}
+
+	client, err := lsp.NewClient(a.lspCtx, config.Command, config.Args...)
+	if err != nil {
+		return nil, err
+	}
+
+	client.SetNotifyHandler(func(method string, params json.RawMessage) {
+		if method != "textDocument/publishDiagnostics" {
+			return
+		}
+		var payload struct {
+			URI         string `json:"uri"`
+			Diagnostics []lsp.Diagnostic
+		}
+		if err := json.Unmarshal(params, &payload); err != nil {
+			return
+		}
+		a.lspMu.Lock()
+		a.lspDiagnostics[payload.URI] = payload.Diagnostics
+		a.lspMu.Unlock()
+	})
+
+	if err := client.Initialize(a.lspCtx, fileURI(a.treeRoot)); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+
+	a.lspMu.Lock()
+	existing = a.lspClients[langID]
+	if existing != nil {
+		// A concurrent initialization won the race.
+		a.lspMu.Unlock()
+		_ = client.Close()
+		return existing, nil
+	}
+	a.lspClients[langID] = client
+	a.lspMu.Unlock()
+	return client, nil
+}
+
+func (a *maneApp) openLSPDocument(buf *editor.Buffer) {
+	if buf == nil || buf.Path() == "" || a.lspCtx == nil {
+		return
+	}
+	uri := fileURI(buf.Path())
+	langID := languageIDFromPath(buf.Path())
+	if uri == "" || langID == "" {
+		return
+	}
+
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return
+	}
+
+	a.lspMu.Lock()
+	_, exists := a.lspDocVersions[uri]
+	a.lspMu.Unlock()
+	if exists {
+		return
+	}
+
+	if err := client.DidOpen(uri, langID, 1, buf.Text()); err != nil {
+		return
+	}
+
+	a.lspMu.Lock()
+	a.lspDocVersions[uri] = 1
+	a.lspMu.Unlock()
+}
+
+func (a *maneApp) scheduleLspDidChange(buf *editor.Buffer, text string) {
+	if buf == nil || buf.Path() == "" || a.lspCtx == nil {
+		return
+	}
+
+	uri := fileURI(buf.Path())
+	langID := languageIDFromPath(buf.Path())
+	if uri == "" || langID == "" {
+		return
+	}
+
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return
+	}
+
+	a.lspMu.Lock()
+	version := a.lspDocVersions[uri]
+	if version == 0 {
+		a.lspDocVersions[uri] = 1
+		a.lspMu.Unlock()
+		_ = client.DidOpen(uri, langID, 1, text)
+		return
+	}
+	version++
+	a.lspDocVersions[uri] = version
+	a.lspMu.Unlock()
+
+	// Best effort async notification; ignore transient transport errors.
+	go func() {
+		_ = client.DidChange(uri, version, text)
+	}()
+}
+
+func (a *maneApp) notifyLSPDidSave(buf *editor.Buffer) {
+	if buf == nil || buf.Path() == "" || a.lspCtx == nil {
+		return
+	}
+	uri := fileURI(buf.Path())
+	langID := languageIDFromPath(buf.Path())
+	if uri == "" || langID == "" {
+		return
+	}
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return
+	}
+	go func() {
+		_ = client.DidSave(uri)
+	}()
+}
+
+func (a *maneApp) notifyLSPDidClose(buf *editor.Buffer) {
+	if buf == nil || buf.Path() == "" || a.lspCtx == nil {
+		return
+	}
+	uri := fileURI(buf.Path())
+	langID := languageIDFromPath(buf.Path())
+	if uri == "" || langID == "" {
+		return
+	}
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return
+	}
+	a.lspMu.Lock()
+	delete(a.lspDocVersions, uri)
+	delete(a.lspDiagnostics, uri)
+	a.lspMu.Unlock()
+	go func() {
+		_ = client.DidClose(uri)
+	}()
+}
+
 // syncTabBar rebuilds the tab bar from the current TabManager state.
 func (a *maneApp) syncTabBar() {
 	buffers := a.tabs.Buffers()
@@ -749,11 +2351,23 @@ func (a *maneApp) switchTab(index int) {
 	if buf != nil {
 		text := buf.Text()
 		a.textArea.SetText(text)
+		a.syncMultiCursorFromTextArea()
 		a.highlight.setup(filepath.Base(buf.Path()))
 		ranges := a.highlight.highlight([]byte(text))
 		a.applyHighlights(text, ranges)
+		a.openLSPDocument(buf)
+		a.applyDiagnosticsForActiveBuffer()
+	} else {
+		a.textArea.SetText("")
+		a.highlight.setup("")
+		a.lspMu.Lock()
+		a.diagnostics = nil
+		a.lspMu.Unlock()
+		a.syncMultiCursorFromTextArea()
+		a.mergeAllHighlights()
 	}
 	a.syncTabBar()
+	a.syncBreadcrumbs()
 	a.updateStatus()
 }
 
@@ -793,6 +2407,7 @@ func (a *maneApp) cmdSaveFile() {
 		a.status.Set(fmt.Sprintf("Save error: %v", err))
 		return
 	}
+	a.notifyLSPDidSave(buf)
 	a.status.Set(fmt.Sprintf("Saved %s", buf.Title()))
 	a.updateStatus()
 }
@@ -802,7 +2417,9 @@ func (a *maneApp) cmdNewFile() {
 	a.tabs.NewUntitled()
 	a.textArea.SetText("")
 	a.highlight.setup("") // no language for untitled
+	a.syncMultiCursorFromTextArea()
 	a.syncTabBar()
+	a.syncBreadcrumbs()
 	a.updateStatus()
 }
 
@@ -811,20 +2428,30 @@ func (a *maneApp) cmdCloseTab() {
 	if a.tabs.Count() == 0 {
 		return
 	}
+	closingBuf := a.tabs.ActiveBuffer()
+	a.notifyLSPDidClose(closingBuf)
 	a.tabs.Close(a.tabs.Active())
 	buf := a.tabs.ActiveBuffer()
 	if buf != nil {
 		text := buf.Text()
 		a.textArea.SetText(text)
+		a.syncMultiCursorFromTextArea()
 		a.highlight.setup(filepath.Base(buf.Path()))
 		ranges := a.highlight.highlight([]byte(text))
 		a.applyHighlights(text, ranges)
+		a.openLSPDocument(buf)
+		a.applyDiagnosticsForActiveBuffer()
 	} else {
 		a.textArea.SetText("")
 		a.highlight.setup("")
-		a.textArea.ClearHighlights()
+		a.lspMu.Lock()
+		a.diagnostics = nil
+		a.lspMu.Unlock()
+		a.syncMultiCursorFromTextArea()
+		a.mergeAllHighlights()
 	}
 	a.syncTabBar()
+	a.syncBreadcrumbs()
 	a.updateStatus()
 }
 
@@ -836,6 +2463,51 @@ func (a *maneApp) cmdUndo() {
 // cmdRedo redoes the last undone edit via the TextArea's built-in redo.
 func (a *maneApp) cmdRedo() {
 	a.textArea.Redo()
+}
+
+// cmdToggleWordWrap toggles the editor word-wrap mode.
+func (a *maneApp) cmdToggleWordWrap() {
+	a.wordWrap = !a.wordWrap
+	a.textArea.SetWordWrap(a.wordWrap)
+	a.updateStatus()
+}
+
+// cmdFoldAtCursor folds the region at the current cursor line.
+func (a *maneApp) cmdFoldAtCursor() {
+	_, row := a.textArea.CursorPosition()
+	if a.foldState.FoldAtLine(row) {
+		a.updateStatus()
+	}
+}
+
+// cmdUnfoldAtCursor unfolds the region at the current cursor line.
+func (a *maneApp) cmdUnfoldAtCursor() {
+	_, row := a.textArea.CursorPosition()
+	if a.foldState.UnfoldAtLine(row) {
+		a.updateStatus()
+	}
+}
+
+// cmdFoldAll folds all foldable regions.
+func (a *maneApp) cmdFoldAll() {
+	a.foldState.FoldAll()
+	a.updateStatus()
+}
+
+// cmdUnfoldAll unfolds all regions.
+func (a *maneApp) cmdUnfoldAll() {
+	a.foldState.UnfoldAll()
+	a.updateStatus()
+}
+
+// updateFoldRegions detects fold regions from the current buffer text.
+func (a *maneApp) updateFoldRegions() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+	regions := editor.DetectFoldRegions(buf.Text())
+	a.foldState.SetRegions(regions)
 }
 
 // rehighlight runs a synchronous highlight pass and applies the results.
@@ -861,6 +2533,7 @@ func (a *maneApp) cmdDeleteLine() {
 		row = maxRow
 	}
 	a.textArea.SetCursorPosition(col, row)
+	a.syncMultiCursorFromTextArea()
 	a.rehighlight(text)
 	a.updateStatus()
 }
@@ -880,6 +2553,7 @@ func (a *maneApp) cmdMoveLineUp() {
 	buf.SetText(newText)
 	a.textArea.SetText(newText)
 	a.textArea.SetCursorPosition(col, row-1)
+	a.syncMultiCursorFromTextArea()
 	a.rehighlight(newText)
 	a.updateStatus()
 }
@@ -899,6 +2573,7 @@ func (a *maneApp) cmdMoveLineDown() {
 	buf.SetText(newText)
 	a.textArea.SetText(newText)
 	a.textArea.SetCursorPosition(col, row+1)
+	a.syncMultiCursorFromTextArea()
 	a.rehighlight(newText)
 	a.updateStatus()
 }
@@ -915,6 +2590,7 @@ func (a *maneApp) cmdDuplicateLine() {
 	buf.SetText(text)
 	a.textArea.SetText(text)
 	a.textArea.SetCursorPosition(col, row+1)
+	a.syncMultiCursorFromTextArea()
 	a.rehighlight(text)
 	a.updateStatus()
 }
@@ -965,7 +2641,13 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 	}
 
 	app := newManeApp(treeRoot)
-	app.cancel = cancel
+	app.lspCancel = cancel
+	app.lspCtx = ctx
+	app.cancel = func() {
+		cancel()
+		app.shutdownLSP()
+	}
+	defer app.shutdownLSP()
 	app.theme = sheet
 	if sheet != nil {
 		// Set gutter style from theme's .comment class (dimmed text).
@@ -990,31 +2672,62 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 	app.replaceW.onReplaceAll = app.onReplaceAll
 	app.replaceW.onClose = app.onReplaceClose
 
+	// Set up go-to-line widget
+	app.gotoLineW = newGotoLineWidget()
+	app.gotoLineW.onSubmit = app.onGotoLine
+	app.gotoLineW.onClose = app.onGotoLineClose
+
+	// Set up file finder.
+	app.fileFinder = newFileFinderWidget()
+	app.fileFinder.onOpen = app.onFileFinder
+	app.fileFinder.onClose = app.onFileFinderClose
+
+	// Set up LSP helper palette for completion, references, and code actions.
+	app.lspPalette = widgets.NewCommandPalette()
+
+	// Set up rename overlay.
+	app.renameW = newRenameWidget()
+	app.renameW.onSubmit = app.cmdRenameSubmit
+	app.renameW.onClose = func() {}
+
 	// Build the command palette with editor actions.
 	app.palette = widgets.NewCommandPalette(commands.AllCommands(commands.Actions{
-		SaveFile:      app.cmdSaveFile,
-		NewFile:       app.cmdNewFile,
-		CloseTab:      app.cmdCloseTab,
-		ToggleSidebar: app.toggleSidebar,
-		Quit:          func() { cancel() },
-		Undo:          app.cmdUndo,
-		Redo:          app.cmdRedo,
-		Find:          func() { app.cmdFind() },
-		Replace:       func() { app.cmdReplace() },
-		DeleteLine:    app.cmdDeleteLine,
-		MoveLineUp:    app.cmdMoveLineUp,
-		MoveLineDown:  app.cmdMoveLineDown,
-		DuplicateLine: app.cmdDuplicateLine,
+		SaveFile:       app.cmdSaveFile,
+		NewFile:        app.cmdNewFile,
+		CloseTab:       app.cmdCloseTab,
+		ToggleSidebar:  app.toggleSidebar,
+		ToggleWordWrap: app.cmdToggleWordWrap,
+		Quit:           func() { app.cancel() },
+		Undo:           app.cmdUndo,
+		Redo:           app.cmdRedo,
+		Find:           func() { app.cmdFind() },
+		Replace:        func() { app.cmdReplace() },
+		GotoLine:       func() { app.cmdGotoLine() },
+		DeleteLine:     app.cmdDeleteLine,
+		MoveLineUp:     app.cmdMoveLineUp,
+		MoveLineDown:   app.cmdMoveLineDown,
+		DuplicateLine:  app.cmdDuplicateLine,
+		FoldAtCursor:   app.cmdFoldAtCursor,
+		UnfoldAtCursor: app.cmdUnfoldAtCursor,
+		FoldAll:        app.cmdFoldAll,
+		UnfoldAll:      app.cmdUnfoldAll,
+		LspComplete:    app.cmdLspComplete,
+		LspDefinition:  app.cmdLspDefinition,
+		LspReferences:  app.cmdLspReferences,
+		LspHover:       app.cmdLspHover,
+		LspRename:      func() { app.cmdLspRename() },
+		LspCodeAction:  app.cmdLspCodeAction,
 	})...)
 
 	// Open files from CLI args, or create an untitled buffer if none.
 	for _, f := range filesToOpen {
-		app.openFile(f)
+		_ = app.openFile(f)
 	}
 	if app.tabs.Count() == 0 {
 		app.tabs.NewUntitled()
 		app.syncTextArea()
 		app.syncTabBar()
+		app.syncBreadcrumbs()
 		app.updateStatus()
 	}
 
@@ -1033,71 +2746,207 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 	// Vertical layout: tab bar, content fills space, status bar fixed at bottom.
 	layout := fluffy.VFlex(
 		fluffy.Fixed(app.tabBar),
+		fluffy.Fixed(app.breadcrumbs),
 		fluffy.Expanded(app.slot),
 		fluffy.Fixed(statusBar),
 	)
 
 	// Global key interceptor for shortcuts that need to work regardless of focus.
-	keys := &globalKeys{onKey: func(key runtime.KeyMsg) runtime.HandleResult {
-		switch key.Key {
-		case terminal.KeyCtrlP:
-			app.palette.Toggle()
-			return runtime.Handled()
-		case terminal.KeyCtrlF:
-			return app.cmdFind()
-		case terminal.KeyRune:
-			if key.Ctrl && key.Rune == 'h' {
-				return app.cmdReplace()
-			}
-			if key.Ctrl && key.Shift && key.Rune == 'K' {
-				app.cmdDeleteLine()
-				return runtime.Handled()
-			}
-			if key.Ctrl && key.Shift && key.Rune == 'D' {
-				app.cmdDuplicateLine()
-				return runtime.Handled()
-			}
-		case terminal.KeyCtrlB:
-			app.toggleSidebar()
-			return runtime.Handled()
-		case terminal.KeyCtrlS:
-			app.cmdSaveFile()
-			return runtime.Handled()
-		case terminal.KeyCtrlN:
-			app.cmdNewFile()
-			return runtime.Handled()
-		case terminal.KeyCtrlW:
-			app.cmdCloseTab()
-			return runtime.Handled()
-		case terminal.KeyCtrlQ:
-			cancel()
-			return runtime.Handled()
-		case terminal.KeyUp:
-			if key.Alt {
-				app.cmdMoveLineUp()
-				return runtime.Handled()
-			}
-		case terminal.KeyDown:
-			if key.Alt {
-				app.cmdMoveLineDown()
-				return runtime.Handled()
-			}
-		case terminal.KeyPageUp:
-			if key.Ctrl {
-				app.prevTab()
-				return runtime.Handled()
-			}
-		case terminal.KeyPageDown:
-			if key.Ctrl {
-				app.nextTab()
-				return runtime.Handled()
-			}
-		}
-		return runtime.Unhandled()
-	}}
+	keys := &globalKeys{
+		onMouse: app.handleGlobalMouse,
+		onPaste: app.handleGlobalPaste,
+		onKey:   app.handleGlobalKey,
+	}
 
-	// Stack: layout at bottom, palette in middle, global keys on top (gets events first).
-	rootWidget := widgets.NewStack(layout, app.palette, keys)
+	// Stack: layout at bottom, palettes in the middle, global keys on top (gets events first).
+	rootWidget := widgets.NewStack(layout, app.palette, app.fileFinder, app.lspPalette, app.renameW, keys)
 
 	return fluffy.RunContext(ctx, rootWidget, opts...)
+}
+
+func (a *maneApp) handleGlobalMouse(mouse runtime.MouseMsg) runtime.HandleResult {
+	if a.isMultiCursorMode() && mouse.Button != runtime.MouseNone && mouse.Action == runtime.MousePress {
+		a.resetMultiCursor()
+	}
+	return runtime.Unhandled()
+}
+
+func (a *maneApp) handleGlobalPaste(paste runtime.PasteMsg) runtime.HandleResult {
+	a.applyPaste(paste.Text)
+	return runtime.Handled()
+}
+
+func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
+	if a.isMultiCursorMode() {
+		switch key.Key {
+		case terminal.KeyCtrlD:
+			a.addNextCursorOccurrence()
+			return runtime.Handled()
+		case terminal.KeyCtrlV:
+			if text := a.clipboardText(); text != "" {
+				a.applyPaste(text)
+				return runtime.Handled()
+			}
+			return runtime.Unhandled()
+		case terminal.KeyRune:
+			if !key.Ctrl && !key.Alt && key.Rune != 0 {
+				a.applyMultiCursorInsert(string(key.Rune))
+				return runtime.Handled()
+			}
+		case terminal.KeyBackspace:
+			a.applyMultiCursorDeleteBackspace()
+			return runtime.Handled()
+		case terminal.KeyDelete:
+			a.applyMultiCursorDeleteForward()
+			return runtime.Handled()
+		case terminal.KeyEnter:
+			a.applyMultiCursorInsert("\n")
+			return runtime.Handled()
+		case terminal.KeyTab:
+			a.applyMultiCursorInsert("\t")
+			return runtime.Handled()
+		case terminal.KeyEscape:
+			a.resetMultiCursor()
+			return runtime.Handled()
+		default:
+			// Exit multi-cursor mode for all other navigation or editing
+			// keys, and let the underlying widget handle movement/commands.
+			a.resetMultiCursor()
+		}
+	}
+
+	switch key.Key {
+	case terminal.KeyCtrlD:
+		a.addNextCursorOccurrence()
+		return runtime.Handled()
+	case terminal.KeyCtrlP:
+		return a.cmdOpenFileFinder()
+	case terminal.KeyRune:
+		if key.Ctrl && key.Shift && (key.Rune == 'P' || key.Rune == 'p') {
+			a.cmdShowPalette()
+			return runtime.Handled()
+		}
+		if key.Ctrl && !key.Shift && (key.Rune == 'P' || key.Rune == 'p') {
+			return a.cmdOpenFileFinder()
+		}
+		if key.Ctrl && key.Rune == 'h' {
+			return a.cmdReplace()
+		}
+		if key.Ctrl && key.Shift && key.Rune == '{' {
+			a.cmdFoldAtCursor()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Shift && key.Rune == '}' {
+			a.cmdGotoMatchingBracket()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Shift && key.Rune == 'K' {
+			a.cmdDeleteLine()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Shift && key.Rune == 'D' {
+			a.cmdDuplicateLine()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Rune == ' ' {
+			a.cmdLspComplete()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Rune == '.' {
+			a.cmdLspCodeAction()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Alt && (key.Rune == 'w' || key.Rune == 'W') {
+			a.cmdToggleWordWrap()
+			return runtime.Handled()
+		}
+	case terminal.KeyCtrlF:
+		return a.cmdFind()
+	case terminal.KeyCtrlG:
+		return a.cmdGotoLine()
+	case terminal.KeyF1:
+		a.cmdLspHover()
+		return runtime.Handled()
+	case terminal.KeyF2:
+		return a.cmdLspRename()
+	case terminal.KeyF12:
+		if key.Shift {
+			a.cmdLspReferences()
+		} else {
+			a.cmdLspDefinition()
+		}
+		return runtime.Handled()
+	case terminal.KeyCtrlB:
+		a.toggleSidebar()
+		return runtime.Handled()
+	case terminal.KeyCtrlS:
+		a.cmdSaveFile()
+		return runtime.Handled()
+	case terminal.KeyCtrlN:
+		a.cmdNewFile()
+		return runtime.Handled()
+	case terminal.KeyCtrlW:
+		a.cmdCloseTab()
+		return runtime.Handled()
+	case terminal.KeyCtrlQ:
+		a.cancel()
+		return runtime.Handled()
+	case terminal.KeyUp:
+		if key.Alt {
+			a.cmdMoveLineUp()
+			return runtime.Handled()
+		}
+	case terminal.KeyDown:
+		if key.Alt {
+			a.cmdMoveLineDown()
+			return runtime.Handled()
+		}
+	case terminal.KeyPageUp:
+		if key.Ctrl {
+			a.prevTab()
+			return runtime.Handled()
+		}
+	case terminal.KeyPageDown:
+		if key.Ctrl {
+			a.nextTab()
+			return runtime.Handled()
+		}
+	}
+	return runtime.Unhandled()
+}
+
+// detectLineEnding returns the dominant line ending string.
+func detectLineEnding(text string) string {
+	if strings.Contains(text, "\r\n") {
+		return "CRLF"
+	}
+	return "LF"
+}
+
+// detectIndentMode returns the current indent style string for status reporting.
+func detectIndentMode(text string) string {
+	indent := editor.DetectIndentStyle(text)
+	if indent == "\t" {
+		return "tabs"
+	}
+	return "spaces(" + strconv.Itoa(len(indent)) + ")"
+}
+
+// detectGitBranch returns the current git branch for the provided path, if known.
+func detectGitBranch(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	cmd := exec.Command("git", "-C", filepath.Dir(path), "rev-parse", "--abbrev-ref", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	branch := strings.TrimSpace(string(out))
+	if branch == "" || branch == "HEAD" {
+		return ""
+	}
+	return branch
 }

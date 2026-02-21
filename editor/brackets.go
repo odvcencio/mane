@@ -37,9 +37,10 @@ func FindMatchingBracket(text string, pos int) (int, bool) {
 		// Scan forward for matching close bracket.
 		depth := 1
 		for i := pos + 1; i < len(runes); i++ {
-			if runes[i] == ch {
+			switch runes[i] {
+			case ch:
 				depth++
-			} else if runes[i] == partner {
+			case partner:
 				depth--
 				if depth == 0 {
 					return i, true
@@ -50,9 +51,10 @@ func FindMatchingBracket(text string, pos int) (int, bool) {
 		// Scan backward for matching open bracket.
 		depth := 1
 		for i := pos - 1; i >= 0; i-- {
-			if runes[i] == ch {
+			switch runes[i] {
+			case ch:
 				depth++
-			} else if runes[i] == partner {
+			case partner:
 				depth--
 				if depth == 0 {
 					return i, true

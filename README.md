@@ -21,7 +21,9 @@ Open a directory to browse its files, or open a file directly.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-theme` | `dark` | Color theme name |
-| `-web` | | Web server address (e.g. `:8080`) |
+| `-web` | | Web server address (e.g. `:8080`) for TUI-in-browser |
+| `-webui` | | Custom web UI address (Monaco Editor frontend) |
+| `-mcp` | | MCP server address |
 
 ### Keyboard Shortcuts
 
@@ -30,9 +32,27 @@ Open a directory to browse its files, or open a file directly.
 | `Ctrl+S` | Save file |
 | `Ctrl+N` | New file |
 | `Ctrl+W` | Close tab |
+| `Ctrl+P` | Open file |
+| `Ctrl+D` | Add next selection occurrence for multi-cursor |
+| `Ctrl+V` | Paste at all multi-cursors |
 | `Ctrl+F` | Find in file |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+H` | Replace |
+| `Ctrl+G` | Go to line |
+| `F12` | Go to definition |
+| `Shift+F12` | Find references |
+| `F1` | Show hover |
+| `F2` | Rename symbol |
+| `Ctrl+.` | Code actions |
+| `Ctrl+Space` | LSP completion |
+| `Ctrl+Shift+K` | Delete line |
+| `Ctrl+Shift+D` | Duplicate line |
+| `Alt+Up` | Move line up |
+| `Alt+Down` | Move line down |
+| `Ctrl+Alt+W` | Toggle word wrap |
 | `Ctrl+B` | Toggle sidebar |
-| `Ctrl+P` | Command palette |
+| `Ctrl+Shift+[` | Fold at cursor |
+| `Ctrl+Shift+]` | Jump to matching bracket |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Shift+Z` | Redo |
 | `Ctrl+A` | Select all |
@@ -50,6 +70,30 @@ Open a directory to browse its files, or open a file directly.
 - Command palette
 - Undo/redo
 - Line numbers
+- Fuzzy file finder (`Ctrl+P`)
+- Go-to-line prompt (`Ctrl+G`)
+- LSP-powered editor actions:
+  - Completion (`Ctrl+Space`)
+  - Definition (`F12`)
+  - References (`Shift+F12`)
+  - Hover (`F1`)
+  - Rename (`F2`)
+  - Code actions (`Ctrl+.`)
+- Multi-cursor:
+  - Add next occurrence (`Ctrl+D`)
+  - Paste is applied to all active cursors (`Ctrl+V`, multiline paste aware)
+  - Mouse click clears multi-cursor mode
+  - Insert/Delete across all cursors from the current selection state
+- Breadcrumb navigation
+- Enhanced status line (encoding, line endings, indent mode, branch, selection)
+- Code folding (fold/unfold regions at cursor, fold all, unfold all)
+- Block (rectangular) selection
+- Web mode:
+  - TUI-in-browser via FluffyUI (`-web :8080`)
+  - Custom Monaco Editor frontend (`-webui :8080`)
+- MCP extensions:
+  - Editor control tools (`mane_open_file`, `mane_read_buffer`, `mane_write_buffer`, etc.)
+  - Code intelligence resources (`mane://file/`, `mane://symbols/`, `mane://diagnostics/`)
 
 ## Performance
 
