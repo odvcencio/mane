@@ -33,11 +33,12 @@ type TextDocumentItem struct {
 
 // CompletionItem represents a completion suggestion.
 type CompletionItem struct {
-	Label         string `json:"label"`
-	Kind          int    `json:"kind"`
-	Detail        string `json:"detail,omitempty"`
-	Documentation string `json:"documentation,omitempty"`
-	InsertText    string `json:"insertText,omitempty"`
+	Label            string `json:"label"`
+	Kind             int    `json:"kind"`
+	Detail           string `json:"detail,omitempty"`
+	Documentation    any    `json:"documentation,omitempty"`
+	InsertText       string `json:"insertText,omitempty"`
+	InsertTextFormat int    `json:"insertTextFormat,omitempty"`
 }
 
 // CompletionList represents LSP completion results.
@@ -76,6 +77,6 @@ type TextEdit struct {
 
 // Hover result.
 type Hover struct {
-	Contents string `json:"contents"`
+	Contents any    `json:"contents"`
 	Range    *Range `json:"range,omitempty"`
 }

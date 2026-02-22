@@ -147,6 +147,96 @@ func (hs *highlightState) Ranges() []gotreesitter.HighlightRange {
 	return hs.ranges
 }
 
+// detectFoldRegions returns fold regions from the current parse tree when
+// available, falling back to brace heuristics for unsupported languages.
+func (hs *highlightState) detectFoldRegions(source string) []editor.FoldRegion {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+
+	if hs.tree != nil && hs.lang != nil {
+		regions := foldRegionsFromTree(hs.tree.RootNode(), hs.lang)
+		if len(regions) > 0 {
+			return regions
+		}
+	}
+	return editor.DetectFoldRegions(source)
+}
+
+// foldRegionsFromTree extracts fold regions from named multiline nodes.
+func foldRegionsFromTree(root *gotreesitter.Node, lang *gotreesitter.Language) []editor.FoldRegion {
+	if root == nil || lang == nil {
+		return nil
+	}
+
+	seen := make(map[[2]int]struct{})
+	regions := make([]editor.FoldRegion, 0, 64)
+	var walk func(node *gotreesitter.Node, isRoot bool)
+
+	walk = func(node *gotreesitter.Node, isRoot bool) {
+		if node == nil {
+			return
+		}
+
+		if !isRoot && node.IsNamed() {
+			start := int(node.StartPoint().Row)
+			end := int(node.EndPoint().Row)
+			if end > start && shouldFoldNode(node, lang) {
+				key := [2]int{start, end}
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					regions = append(regions, editor.FoldRegion{
+						StartLine: start,
+						EndLine:   end,
+					})
+				}
+			}
+		}
+
+		n := node.NamedChildCount()
+		for i := 0; i < n; i++ {
+			walk(node.NamedChild(i), false)
+		}
+	}
+
+	walk(root, true)
+	sort.Slice(regions, func(i, j int) bool {
+		if regions[i].StartLine == regions[j].StartLine {
+			return regions[i].EndLine < regions[j].EndLine
+		}
+		return regions[i].StartLine < regions[j].StartLine
+	})
+	return regions
+}
+
+func shouldFoldNode(node *gotreesitter.Node, lang *gotreesitter.Language) bool {
+	if node == nil || node.NamedChildCount() == 0 {
+		return false
+	}
+
+	nodeType := strings.ToLower(node.Type(lang))
+	switch nodeType {
+	case "source_file", "program", "translation_unit", "module":
+		return false
+	}
+
+	// Common structural node kinds across languages.
+	keywords := []string{
+		"block", "body", "declaration", "statement", "function", "method",
+		"class", "struct", "interface", "enum", "object", "array", "map",
+		"list", "switch", "case", "if", "else", "for", "while", "loop",
+		"try", "catch", "finally", "impl", "namespace", "comment",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(nodeType, kw) {
+			return true
+		}
+	}
+
+	// Generic fallback for unnamed grammar variants: multiline nodes with
+	// multiple named children are usually foldable containers.
+	return node.NamedChildCount() >= 2
+}
+
 // contentSlot is a simple wrapper widget whose child can be swapped at runtime.
 type contentSlot struct {
 	widgets.Base
@@ -249,6 +339,7 @@ type maneApp struct {
 	bracketHighlights []widgets.TextAreaHighlight // bracket match highlights
 	multiCursor       *editor.MultiCursor
 	multiHighlights   []widgets.TextAreaHighlight // cached multi-cursor highlights
+	blockHighlights   []widgets.TextAreaHighlight // cached block selection highlights
 
 	// File finder cache.
 	finderRoot string
@@ -265,6 +356,10 @@ type maneApp struct {
 	wordWrap       bool
 	foldState      *editor.FoldState
 	blockSelection *editor.BlockSelection
+	blockAnchorRow int
+	blockAnchorCol int
+	blockFocusRow  int
+	blockFocusCol  int
 
 	// LSP integration.
 	lspClients     map[string]*lsp.Client
@@ -282,6 +377,9 @@ type maneApp struct {
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
 func newManeApp(treeRoot string) *maneApp {
+	servers := lsp.DefaultServers()
+	applyLSPServerOverrides(servers, treeRoot)
+
 	app := &maneApp{
 		tabs:           editor.NewTabManager(),
 		textArea:       widgets.NewTextArea(),
@@ -292,7 +390,7 @@ func newManeApp(treeRoot string) *maneApp {
 		sidebarVisible: true,
 		lspClients:     make(map[string]*lsp.Client),
 		lspDocVersions: make(map[string]int),
-		lspServers:     lsp.DefaultServers(),
+		lspServers:     servers,
 		lspDiagnostics: make(map[string][]lsp.Diagnostic),
 		wordWrap:       false,
 		foldState:      editor.NewFoldState(),
@@ -372,6 +470,7 @@ func newManeApp(treeRoot string) *maneApp {
 		app.syncMultiCursorFromTextArea()
 		app.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 			app.applyHighlights(text, ranges)
+			app.updateFoldRegions(text)
 		})
 
 		app.scheduleLspDidChange(buf, text)
@@ -425,6 +524,48 @@ func languageIDFromPath(path string) string {
 		return ""
 	}
 	return strings.ToLower(entry.Name)
+}
+
+func lspConfigSearchPaths(treeRoot string) []string {
+	paths := make([]string, 0, 3)
+	if envPath := strings.TrimSpace(os.Getenv("MANE_LSP_CONFIG")); envPath != "" {
+		paths = append(paths, envPath)
+	}
+	if treeRoot != "" {
+		paths = append(paths, filepath.Join(treeRoot, ".mane-lsp.json"))
+	}
+	if cfgRoot, err := os.UserConfigDir(); err == nil && cfgRoot != "" {
+		paths = append(paths, filepath.Join(cfgRoot, "mane", "lsp.json"))
+	}
+	return paths
+}
+
+func applyLSPServerOverrides(servers map[string]lsp.ServerConfig, treeRoot string) {
+	if len(servers) == 0 {
+		return
+	}
+
+	for _, configPath := range lspConfigSearchPaths(treeRoot) {
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			continue
+		}
+
+		overrides := make(map[string]lsp.ServerConfig)
+		if err := json.Unmarshal(data, &overrides); err != nil {
+			continue
+		}
+
+		for langID, cfg := range overrides {
+			langID = strings.ToLower(strings.TrimSpace(langID))
+			cfg.Command = strings.TrimSpace(cfg.Command)
+			if langID == "" || cfg.Command == "" {
+				continue
+			}
+			servers[langID] = cfg
+		}
+		break
+	}
 }
 
 func filePathFromURI(uri string) string {
@@ -586,6 +727,7 @@ func (a *maneApp) setCursorFromLSPPosition(uri string, pos lsp.Position) error {
 			a.openLSPDocument(a.tabs.ActiveBuffer())
 			text := a.tabs.ActiveBuffer().Text()
 			a.applyHighlights(text, a.highlight.highlight([]byte(text)))
+			a.updateFoldRegions(text)
 		} else {
 			return err
 		}
@@ -598,6 +740,7 @@ func (a *maneApp) setCursorFromLSPPosition(uri string, pos lsp.Position) error {
 	byteOffset := lspOffsetFromPosition(text, pos)
 	mapping := byteOffsetToRuneOffset(text)
 	runeOffset := mapping[byteOffset]
+	a.ensureLineVisible(pos.Line)
 	a.textArea.SetCursorOffset(runeOffset)
 	a.updateStatus()
 	return nil
@@ -682,7 +825,7 @@ func (a *maneApp) openFile(path string) error {
 		a.applyHighlights(text, ranges)
 		a.openLSPDocument(buf)
 		a.applyDiagnosticsForActiveBuffer()
-		a.updateFoldRegions()
+		a.updateFoldRegions(text)
 		a.updateStatus()
 	}
 	return nil
@@ -695,16 +838,23 @@ func (a *maneApp) syncTextArea() {
 		a.textArea.SetText("")
 		a.bracketHighlights = nil
 		a.multiHighlights = nil
+		a.blockHighlights = nil
+		if a.blockSelection != nil {
+			a.blockSelection.Clear()
+		}
+		a.foldState.SetRegions(nil)
 		if a.multiCursor == nil {
 			a.multiCursor = editor.NewMultiCursor()
 		} else {
 			a.multiCursor.Reset()
 		}
+		a.textArea.SetVisibleLines(nil)
 		a.applyDiagnosticsForActiveBuffer()
 		return
 	}
 	a.textArea.SetText(buf.Text())
 	a.syncMultiCursorFromTextArea()
+	a.clearBlockSelection()
 	a.applyDiagnosticsForActiveBuffer()
 }
 
@@ -788,6 +938,10 @@ func (a *maneApp) applyMultiCursorInsert(text string) {
 
 func (a *maneApp) applyPaste(text string) {
 	if text == "" {
+		return
+	}
+	if a.isBlockSelectionMode() {
+		a.applyBlockInsert(text)
 		return
 	}
 	if a.isMultiCursorMode() {
@@ -889,6 +1043,231 @@ func (a *maneApp) syncMultiHighlights() {
 	a.multiHighlights = highlights
 }
 
+func (a *maneApp) isBlockSelectionMode() bool {
+	return a.blockSelection != nil && a.blockSelection.Active
+}
+
+func (a *maneApp) clearBlockSelection() {
+	if a.blockSelection == nil || !a.blockSelection.Active {
+		return
+	}
+	a.blockSelection.Clear()
+	a.blockHighlights = nil
+	a.mergeAllHighlights()
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func (a *maneApp) maxLineColumn(text string) int {
+	lines := strings.Split(text, "\n")
+	maxCol := 0
+	for _, line := range lines {
+		if col := utf8.RuneCountInString(line); col > maxCol {
+			maxCol = col
+		}
+	}
+	return maxCol
+}
+
+func (a *maneApp) expandBlockSelection(deltaRow, deltaCol int) {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil || a.blockSelection == nil {
+		return
+	}
+
+	text := a.textArea.Text()
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return
+	}
+	maxRow := len(lines) - 1
+	maxCol := a.maxLineColumn(text) + 1
+
+	if !a.blockSelection.Active {
+		col, row := a.textArea.CursorPosition()
+		a.blockAnchorRow = clampInt(row, 0, maxRow)
+		a.blockAnchorCol = clampInt(col, 0, maxCol)
+		a.blockFocusRow = a.blockAnchorRow
+		a.blockFocusCol = a.blockAnchorCol
+		// Block selection and multi-cursor are mutually exclusive.
+		a.syncMultiCursorFromTextArea()
+	}
+
+	a.blockFocusRow = clampInt(a.blockFocusRow+deltaRow, 0, maxRow)
+	a.blockFocusCol = clampInt(a.blockFocusCol+deltaCol, 0, maxCol)
+	a.blockSelection.Set(
+		a.blockAnchorRow,
+		a.blockFocusRow,
+		a.blockAnchorCol,
+		a.blockFocusCol,
+	)
+	a.textArea.SelectNone()
+	a.syncBlockHighlights()
+	a.updateStatus()
+}
+
+func (a *maneApp) syncBlockHighlights() {
+	if !a.isBlockSelectionMode() {
+		a.blockHighlights = nil
+		return
+	}
+
+	text := a.textArea.Text()
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		a.blockHighlights = nil
+		return
+	}
+
+	startLine, endLine := a.blockSelection.Lines()
+	startCol, endCol := a.blockSelection.Cols()
+	if startLine < 0 {
+		startLine = 0
+	}
+	if endLine >= len(lines) {
+		endLine = len(lines) - 1
+	}
+	if startLine > endLine {
+		a.blockHighlights = nil
+		return
+	}
+
+	// Pre-compute line-start rune offsets.
+	lineStart := make([]int, len(lines))
+	offset := 0
+	for i, line := range lines {
+		lineStart[i] = offset
+		offset += utf8.RuneCountInString(line)
+		if i < len(lines)-1 {
+			offset++ // newline rune
+		}
+	}
+
+	style := backend.DefaultStyle().Background(backend.ColorRGB(0x2f, 0x5f, 0x87))
+	highlights := make([]widgets.TextAreaHighlight, 0, endLine-startLine+1)
+	for line := startLine; line <= endLine; line++ {
+		runes := []rune(lines[line])
+		start := startCol
+		end := endCol
+		if start > len(runes) {
+			start = len(runes)
+		}
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if start > end {
+			start = end
+		}
+		// Keep caret-visible highlight for zero-width column selections.
+		if end == start {
+			if start < len(runes) {
+				end = start + 1
+			} else {
+				continue
+			}
+		}
+
+		highlights = append(highlights, widgets.TextAreaHighlight{
+			Start: lineStart[line] + start,
+			End:   lineStart[line] + end,
+			Style: style,
+		})
+	}
+	a.blockHighlights = highlights
+	a.mergeAllHighlights()
+}
+
+func (a *maneApp) applyBlockSelectionText(newText string, cursorCol, cursorRow int) {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	buf.SetText(newText)
+	a.suppressChange = true
+	a.textArea.SetText(newText)
+	a.textArea.SetCursorPosition(cursorCol, cursorRow)
+	a.textArea.SelectNone()
+	a.suppressChange = false
+	a.clearBlockSelection()
+	a.syncMultiCursorFromTextArea()
+	a.rehighlight(newText)
+	a.scheduleLspDidChange(buf, newText)
+	a.updateBracketMatch()
+	a.updateStatus()
+}
+
+func (a *maneApp) applyBlockInsert(insert string) {
+	if !a.isBlockSelectionMode() {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	bs := *a.blockSelection
+	text := buf.Text()
+	if bs.EndCol > bs.StartCol {
+		text = bs.DeleteBlock(text)
+		bs.EndCol = bs.StartCol
+	}
+	newText := bs.InsertAtBlock(text, insert)
+	insertWidth := utf8.RuneCountInString(insert)
+	a.applyBlockSelectionText(newText, bs.StartCol+insertWidth, bs.EndLine)
+}
+
+func (a *maneApp) applyBlockBackspace() {
+	if !a.isBlockSelectionMode() {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	bs := *a.blockSelection
+	text := buf.Text()
+	cursorCol := bs.StartCol
+
+	if bs.EndCol > bs.StartCol {
+		text = bs.DeleteBlock(text)
+	} else if bs.StartCol > 0 {
+		bs.StartCol--
+		bs.EndCol = bs.StartCol + 1
+		text = bs.DeleteBlock(text)
+		cursorCol = bs.StartCol
+	} else {
+		return
+	}
+	a.applyBlockSelectionText(text, cursorCol, bs.EndLine)
+}
+
+func (a *maneApp) applyBlockDeleteForward() {
+	if !a.isBlockSelectionMode() {
+		return
+	}
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		return
+	}
+
+	bs := *a.blockSelection
+	if bs.EndCol == bs.StartCol {
+		bs.EndCol = bs.StartCol + 1
+	}
+	newText := bs.DeleteBlock(buf.Text())
+	a.applyBlockSelectionText(newText, bs.StartCol, bs.EndLine)
+}
+
 // updateStatus refreshes the status bar signal with the current buffer info.
 // Format: " {title}{dirty}  {lang}  Ln {row+1}, Col {col+1}"
 func (a *maneApp) updateStatus() {
@@ -940,16 +1319,23 @@ func (a *maneApp) updateStatus() {
 		status += fmt.Sprintf("  Sel %d", selectionCount)
 		if a.isMultiCursorMode() {
 			status += fmt.Sprintf(" (%d cursors)", a.multiCursor.Count())
+		} else if a.isBlockSelectionMode() {
+			status += " (block)"
 		}
 	}
 	if diagSummary := a.diagnosticSummary(); diagSummary != "" {
 		status += "  " + diagSummary
 	}
 	a.status.Set(status)
+	a.syncBreadcrumbs()
 }
 
 // selectionCount returns the currently selected rune count in the editor.
 func (a *maneApp) selectionCount() int {
+	if a.isBlockSelectionMode() {
+		return len(strings.Join(a.blockSelection.ExtractBlock(a.textArea.Text()), ""))
+	}
+
 	type interval struct {
 		Start int
 		End   int
@@ -1012,6 +1398,66 @@ func (a *maneApp) selectionCount() int {
 		total += r.End - r.Start
 	}
 	return total
+}
+
+func nodeContainsPoint(node *gotreesitter.Node, row, col int) bool {
+	if node == nil {
+		return false
+	}
+	start := node.StartPoint()
+	end := node.EndPoint()
+	if row < int(start.Row) || row > int(end.Row) {
+		return false
+	}
+	if row == int(start.Row) && col < int(start.Column) {
+		return false
+	}
+	if row == int(end.Row) && col > int(end.Column) {
+		return false
+	}
+	return true
+}
+
+func symbolPathAtPoint(root *gotreesitter.Node, lang *gotreesitter.Language, source []byte, row, col int) []string {
+	if root == nil || lang == nil {
+		return nil
+	}
+
+	path := make([]string, 0, 8)
+	var walk func(node *gotreesitter.Node)
+	walk = func(node *gotreesitter.Node) {
+		if node == nil || !nodeContainsPoint(node, row, col) {
+			return
+		}
+
+		if kind := symbolKindFromNodeType(node.Type(lang)); kind != "" {
+			if name := extractSymbolName(node, lang, source); name != "" {
+				path = append(path, name)
+			}
+		}
+
+		for i := 0; i < node.NamedChildCount(); i++ {
+			child := node.NamedChild(i)
+			if nodeContainsPoint(child, row, col) {
+				walk(child)
+				return
+			}
+		}
+	}
+
+	walk(root)
+	return path
+}
+
+func (a *maneApp) currentSymbolPath(text string, row, col int) []string {
+	a.highlight.mu.Lock()
+	tree := a.highlight.tree
+	lang := a.highlight.lang
+	a.highlight.mu.Unlock()
+	if tree == nil || lang == nil {
+		return nil
+	}
+	return symbolPathAtPoint(tree.RootNode(), lang, []byte(text), row, col)
 }
 
 // syncBreadcrumbs rebuilds breadcrumb links from the active file path.
@@ -1089,6 +1535,11 @@ func (a *maneApp) syncBreadcrumbs() {
 			}(path, !isFile),
 		}
 		items = append(items, item)
+	}
+
+	col, row := a.textArea.CursorPosition()
+	for _, symbol := range a.currentSymbolPath(buf.Text(), row, col) {
+		items = append(items, widgets.BreadcrumbItem{Label: symbol})
 	}
 
 	if len(items) == 0 {
@@ -1340,6 +1791,7 @@ func (a *maneApp) onReplace(search, replace string) {
 	text := buf.Text()
 	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 		a.applyHighlights(text, ranges)
+		a.updateFoldRegions(text)
 	})
 }
 
@@ -1371,6 +1823,7 @@ func (a *maneApp) onReplaceAll(search, replace string) {
 	text := buf.Text()
 	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 		a.applyHighlights(text, ranges)
+		a.updateFoldRegions(text)
 	})
 }
 
@@ -1413,6 +1866,7 @@ func (a *maneApp) onGotoLine(line int) {
 		line = maxLine
 	}
 
+	a.ensureLineVisible(line - 1)
 	a.textArea.SetCursorPosition(0, line-1)
 	a.updateStatus()
 }
@@ -1456,6 +1910,8 @@ func (a *maneApp) jumpToMatch(idx int) {
 	text := a.textArea.Text()
 	mapping := byteOffsetToRuneOffset(text)
 	runeStart := mapping[m.Start]
+	pos := lspPositionFromByteOffset(text, m.Start)
+	a.ensureLineVisible(pos.Line)
 	a.textArea.SetCursorOffset(runeStart)
 }
 
@@ -1464,7 +1920,14 @@ func (a *maneApp) applySearchHighlights() {
 	a.mergeAllHighlights()
 }
 
+func (a *maneApp) ensureLSPPalette() {
+	if a.lspPalette == nil {
+		a.lspPalette = widgets.NewCommandPalette()
+	}
+}
+
 func (a *maneApp) showLSPPalette(commands []widgets.PaletteCommand, status string) {
+	a.ensureLSPPalette()
 	if len(commands) == 0 {
 		a.lspPalette.Hide()
 		a.status.Set(" " + status)
@@ -1476,8 +1939,62 @@ func (a *maneApp) showLSPPalette(commands []widgets.PaletteCommand, status strin
 	a.status.Set(" " + status)
 }
 
+func (a *maneApp) lspHoverContent() (string, error) {
+	buf, uri, langID, _, err := a.activeLSPSession()
+	if err != nil {
+		return "", err
+	}
+	pos, err := a.activeCursorPosition(buf)
+	if err != nil {
+		return "", err
+	}
+
+	var hover *lsp.Hover
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		hover, callErr = client.HoverInfo(a.lspCtx, uri, pos)
+		return callErr
+	})
+	if err != nil {
+		return "", err
+	}
+	if hover == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(extractHoverText(hover.Contents)), nil
+}
+
+func (a *maneApp) cmdLspHoverPanel() runtime.HandleResult {
+	content, err := a.lspHoverContent()
+	if err != nil {
+		a.status.Set(fmt.Sprintf(" hover failed: %v", err))
+		return runtime.Handled()
+	}
+	if content == "" {
+		a.status.Set(" no hover info")
+		return runtime.Handled()
+	}
+
+	label := content
+	if idx := strings.IndexRune(label, '\n'); idx >= 0 {
+		label = label[:idx]
+	}
+	if len(label) > 80 {
+		label = label[:77] + "..."
+	}
+
+	a.showLSPPalette([]widgets.PaletteCommand{
+		{
+			ID:          "lsp.hover",
+			Label:       label,
+			Description: strings.ReplaceAll(content, "\n", " "),
+		},
+	}, "Hover")
+	return runtime.Handled()
+}
+
 func (a *maneApp) cmdLspComplete() {
-	buf, uri, _, client, err := a.activeLSPSession()
+	buf, uri, langID, _, err := a.activeLSPSession()
 	if err != nil {
 		a.status.Set(" " + err.Error())
 		return
@@ -1488,7 +2005,12 @@ func (a *maneApp) cmdLspComplete() {
 		return
 	}
 
-	items, err := client.Completion(a.lspCtx, uri, pos)
+	var items []lsp.CompletionItem
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		items, callErr = client.Completion(a.lspCtx, uri, pos)
+		return callErr
+	})
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" completion failed: %v", err))
 		return
@@ -1509,7 +2031,7 @@ func (a *maneApp) cmdLspComplete() {
 		}
 		description := item.Detail
 		if description == "" {
-			description = item.Documentation
+			description = extractHoverText(item.Documentation)
 		}
 		itemCopy := item
 		cmds = append(cmds, widgets.PaletteCommand{
@@ -1531,6 +2053,118 @@ func (a *maneApp) cmdLspComplete() {
 	a.showLSPPalette(cmds, fmt.Sprintf("Completion: %d items", len(cmds)))
 }
 
+func parseSnippetPlaceholder(token string) (index int, text string, ok bool) {
+	parts := strings.SplitN(token, ":", 2)
+	if len(parts) == 0 {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, "", false
+	}
+	if len(parts) == 2 {
+		return n, parts[1], true
+	}
+	return n, "", true
+}
+
+func expandSnippetInsert(snippet string) (string, int) {
+	var out strings.Builder
+	runeLen := 0
+	firstTabStop := -1
+	finalTabStop := -1
+
+	appendText := func(s string) {
+		if s == "" {
+			return
+		}
+		out.WriteString(s)
+		runeLen += utf8.RuneCountInString(s)
+	}
+
+	for i := 0; i < len(snippet); {
+		if snippet[i] == '\\' && i+1 < len(snippet) {
+			next := snippet[i+1]
+			if next == '$' || next == '{' || next == '}' || next == '\\' {
+				appendText(snippet[i+1 : i+2])
+				i += 2
+				continue
+			}
+		}
+
+		if snippet[i] != '$' {
+			_, size := utf8.DecodeRuneInString(snippet[i:])
+			if size <= 0 {
+				size = 1
+			}
+			appendText(snippet[i : i+size])
+			i += size
+			continue
+		}
+
+		// Braced placeholder: ${1:name}, ${2}, ${0}
+		if i+1 < len(snippet) && snippet[i+1] == '{' {
+			end := i + 2
+			for end < len(snippet) && snippet[end] != '}' {
+				end++
+			}
+			if end >= len(snippet) {
+				appendText(snippet[i : i+1])
+				i++
+				continue
+			}
+
+			idx, placeholderText, ok := parseSnippetPlaceholder(snippet[i+2 : end])
+			if !ok {
+				appendText(snippet[i : end+1])
+				i = end + 1
+				continue
+			}
+			if idx == 0 {
+				if finalTabStop < 0 {
+					finalTabStop = runeLen
+				}
+			} else if firstTabStop < 0 {
+				firstTabStop = runeLen
+			}
+			appendText(placeholderText)
+			i = end + 1
+			continue
+		}
+
+		// Numeric tab stop: $1, $0.
+		if i+1 < len(snippet) && snippet[i+1] >= '0' && snippet[i+1] <= '9' {
+			j := i + 1
+			for j < len(snippet) && snippet[j] >= '0' && snippet[j] <= '9' {
+				j++
+			}
+			idx, _ := strconv.Atoi(snippet[i+1 : j])
+			if idx == 0 {
+				if finalTabStop < 0 {
+					finalTabStop = runeLen
+				}
+			} else if firstTabStop < 0 {
+				firstTabStop = runeLen
+			}
+			i = j
+			continue
+		}
+
+		appendText(snippet[i : i+1])
+		i++
+	}
+
+	text := out.String()
+	switch {
+	case firstTabStop >= 0:
+		return text, firstTabStop
+	case finalTabStop >= 0:
+		return text, finalTabStop
+	default:
+		return text, runeLen
+	}
+}
+
 func (a *maneApp) applyLSPCompletion(item lsp.CompletionItem) {
 	insert := item.InsertText
 	if insert == "" {
@@ -1539,6 +2173,12 @@ func (a *maneApp) applyLSPCompletion(item lsp.CompletionItem) {
 	if insert == "" {
 		return
 	}
+
+	cursorDelta := utf8.RuneCountInString(insert)
+	if item.InsertTextFormat == 2 {
+		insert, cursorDelta = expandSnippetInsert(insert)
+	}
+
 	buf := a.tabs.ActiveBuffer()
 	if buf == nil {
 		return
@@ -1552,7 +2192,7 @@ func (a *maneApp) applyLSPCompletion(item lsp.CompletionItem) {
 	buf.SetText(newText)
 	a.textArea.SetText(newText)
 	a.suppressChange = false
-	a.textArea.SetCursorOffset(offsetRunes + utf8.RuneCountInString(insert))
+	a.textArea.SetCursorOffset(offsetRunes + cursorDelta)
 	a.textArea.SetSelection(widgets.Selection{})
 	a.syncMultiCursorFromTextArea()
 	a.rehighlight(newText)
@@ -1563,7 +2203,7 @@ func (a *maneApp) applyLSPCompletion(item lsp.CompletionItem) {
 }
 
 func (a *maneApp) cmdLspDefinition() {
-	buf, uri, _, client, err := a.activeLSPSession()
+	buf, uri, langID, _, err := a.activeLSPSession()
 	if err != nil {
 		a.status.Set(" " + err.Error())
 		return
@@ -1574,7 +2214,12 @@ func (a *maneApp) cmdLspDefinition() {
 		return
 	}
 
-	locations, err := client.Definition(a.lspCtx, uri, pos)
+	var locations []lsp.Location
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		locations, callErr = client.Definition(a.lspCtx, uri, pos)
+		return callErr
+	})
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" definition lookup failed: %v", err))
 		return
@@ -1591,7 +2236,7 @@ func (a *maneApp) cmdLspDefinition() {
 }
 
 func (a *maneApp) cmdLspReferences() {
-	buf, uri, _, client, err := a.activeLSPSession()
+	buf, uri, langID, _, err := a.activeLSPSession()
 	if err != nil {
 		a.status.Set(" " + err.Error())
 		return
@@ -1602,7 +2247,12 @@ func (a *maneApp) cmdLspReferences() {
 		return
 	}
 
-	locations, err := client.References(a.lspCtx, uri, pos)
+	var locations []lsp.Location
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		locations, callErr = client.References(a.lspCtx, uri, pos)
+		return callErr
+	})
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" references lookup failed: %v", err))
 		return
@@ -1638,26 +2288,11 @@ func (a *maneApp) cmdLspReferences() {
 }
 
 func (a *maneApp) cmdLspHover() {
-	buf, uri, _, client, err := a.activeLSPSession()
-	if err != nil {
-		a.status.Set(" " + err.Error())
-		return
-	}
-	pos, err := a.activeCursorPosition(buf)
-	if err != nil {
-		a.status.Set(" " + err.Error())
-		return
-	}
-	hover, err := client.HoverInfo(a.lspCtx, uri, pos)
+	content, err := a.lspHoverContent()
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" hover failed: %v", err))
 		return
 	}
-	if hover == nil {
-		a.status.Set(" no hover info")
-		return
-	}
-	content := extractHoverText(hover.Contents)
 	if content == "" {
 		a.status.Set(" no hover info")
 		return
@@ -1665,11 +2300,65 @@ func (a *maneApp) cmdLspHover() {
 	if len(content) > 160 {
 		content = content[:157] + "..."
 	}
-	a.status.Set(" " + content)
+	a.status.Set(" " + strings.ReplaceAll(content, "\n", " "))
+}
+
+func (a *maneApp) cmdLspDiagnostics() {
+	buf := a.tabs.ActiveBuffer()
+	if buf == nil {
+		a.status.Set(" no active buffer")
+		return
+	}
+
+	diags := a.lspDiagnosticsForActive()
+	if len(diags) == 0 {
+		a.status.Set(" no diagnostics")
+		return
+	}
+
+	a.ensureLSPPalette()
+	cmds := make([]widgets.PaletteCommand, 0, len(diags))
+	for i, diag := range diags {
+		sev := "I"
+		switch diag.Severity {
+		case 1:
+			sev = "E"
+		case 2:
+			sev = "W"
+		case 4:
+			sev = "H"
+		}
+
+		msg := strings.ReplaceAll(strings.TrimSpace(diag.Message), "\n", " ")
+		if len(msg) > 90 {
+			msg = msg[:87] + "..."
+		}
+		source := strings.TrimSpace(diag.Source)
+		if source == "" {
+			source = filepath.Base(buf.Path())
+		}
+
+		start := diag.Range.Start
+		cmds = append(cmds, widgets.PaletteCommand{
+			ID:          fmt.Sprintf("lsp.diag.%d", i),
+			Label:       fmt.Sprintf("[%s] Ln %d, Col %d", sev, start.Line+1, start.Character+1),
+			Description: fmt.Sprintf("%s: %s", source, msg),
+			OnExecute: func(pos lsp.Position) func() {
+				return func() {
+					a.ensureLineVisible(pos.Line)
+					a.textArea.SetCursorPosition(pos.Character, pos.Line)
+					a.lspPalette.Hide()
+					a.updateStatus()
+				}
+			}(start),
+		})
+	}
+
+	a.showLSPPalette(cmds, fmt.Sprintf("Diagnostics: %d", len(cmds)))
 }
 
 func (a *maneApp) cmdLspCodeAction() {
-	buf, uri, _, client, err := a.activeLSPSession()
+	buf, uri, langID, _, err := a.activeLSPSession()
 	if err != nil {
 		a.status.Set(" " + err.Error())
 		return
@@ -1680,7 +2369,12 @@ func (a *maneApp) cmdLspCodeAction() {
 		return
 	}
 	diags := a.lspDiagnosticsForActive()
-	actions, err := client.CodeAction(a.lspCtx, uri, lsp.Range{Start: pos, End: pos}, diags)
+	var actions []lsp.CodeAction
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		actions, callErr = client.CodeAction(a.lspCtx, uri, lsp.Range{Start: pos, End: pos}, diags)
+		return callErr
+	})
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" code action failed: %v", err))
 		return
@@ -1734,7 +2428,7 @@ func (a *maneApp) cmdRenameSubmit(name string) {
 		a.status.Set(" rename cancelled")
 		return
 	}
-	buf, uri, _, client, err := a.activeLSPSession()
+	buf, uri, langID, _, err := a.activeLSPSession()
 	if err != nil {
 		a.status.Set(" " + err.Error())
 		return
@@ -1745,7 +2439,12 @@ func (a *maneApp) cmdRenameSubmit(name string) {
 		return
 	}
 
-	changes, err := client.Rename(a.lspCtx, uri, pos, name)
+	var changes map[string][]lsp.TextEdit
+	err = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		var callErr error
+		changes, callErr = client.Rename(a.lspCtx, uri, pos, name)
+		return callErr
+	})
 	if err != nil {
 		a.status.Set(fmt.Sprintf(" rename failed: %v", err))
 		return
@@ -2032,6 +2731,7 @@ func (a *maneApp) mergeAllHighlights() {
 	merged = append(merged, a.bracketHighlights...)
 	merged = append(merged, a.diagnostics...)
 	merged = append(merged, a.multiHighlights...)
+	merged = append(merged, a.blockHighlights...)
 	// If search is active, add search highlights on top
 	if len(a.searchMatches) > 0 {
 		text := a.textArea.Text()
@@ -2226,6 +2926,68 @@ func (a *maneApp) lspClientForLanguage(langID string) (*lsp.Client, error) {
 	return client, nil
 }
 
+func isLSPTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"client closed",
+		"client is closed",
+		"broken pipe",
+		"connection reset",
+		"eof",
+		"read/write on closed pipe",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *maneApp) resetLSPClient(langID string) {
+	if langID == "" {
+		return
+	}
+	a.lspMu.Lock()
+	client := a.lspClients[langID]
+	delete(a.lspClients, langID)
+	// Force DidOpen re-sync for docs in this language.
+	for _, buf := range a.tabs.Buffers() {
+		if buf == nil || buf.Path() == "" {
+			continue
+		}
+		if languageIDFromPath(buf.Path()) != langID {
+			continue
+		}
+		delete(a.lspDocVersions, fileURI(buf.Path()))
+	}
+	a.lspMu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+}
+
+func (a *maneApp) withRetryingLSPClient(langID string, op func(*lsp.Client) error) error {
+	client, err := a.lspClientForLanguage(langID)
+	if err != nil {
+		return err
+	}
+	if err := op(client); err == nil {
+		return nil
+	} else if !isLSPTransportError(err) {
+		return err
+	}
+
+	a.resetLSPClient(langID)
+	client, err = a.lspClientForLanguage(langID)
+	if err != nil {
+		return err
+	}
+	return op(client)
+}
+
 func (a *maneApp) openLSPDocument(buf *editor.Buffer) {
 	if buf == nil || buf.Path() == "" || a.lspCtx == nil {
 		return
@@ -2236,11 +2998,6 @@ func (a *maneApp) openLSPDocument(buf *editor.Buffer) {
 		return
 	}
 
-	client, err := a.lspClientForLanguage(langID)
-	if err != nil {
-		return
-	}
-
 	a.lspMu.Lock()
 	_, exists := a.lspDocVersions[uri]
 	a.lspMu.Unlock()
@@ -2248,13 +3005,15 @@ func (a *maneApp) openLSPDocument(buf *editor.Buffer) {
 		return
 	}
 
-	if err := client.DidOpen(uri, langID, 1, buf.Text()); err != nil {
-		return
-	}
-
-	a.lspMu.Lock()
-	a.lspDocVersions[uri] = 1
-	a.lspMu.Unlock()
+	_ = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		if err := client.DidOpen(uri, langID, 1, buf.Text()); err != nil {
+			return err
+		}
+		a.lspMu.Lock()
+		a.lspDocVersions[uri] = 1
+		a.lspMu.Unlock()
+		return nil
+	})
 }
 
 func (a *maneApp) scheduleLspDidChange(buf *editor.Buffer, text string) {
@@ -2268,27 +3027,19 @@ func (a *maneApp) scheduleLspDidChange(buf *editor.Buffer, text string) {
 		return
 	}
 
-	client, err := a.lspClientForLanguage(langID)
-	if err != nil {
-		return
-	}
-
-	a.lspMu.Lock()
-	version := a.lspDocVersions[uri]
-	if version == 0 {
-		a.lspDocVersions[uri] = 1
+	_ = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		a.lspMu.Lock()
+		version := a.lspDocVersions[uri]
+		if version == 0 {
+			a.lspDocVersions[uri] = 1
+			a.lspMu.Unlock()
+			return client.DidOpen(uri, langID, 1, text)
+		}
+		version++
+		a.lspDocVersions[uri] = version
 		a.lspMu.Unlock()
-		_ = client.DidOpen(uri, langID, 1, text)
-		return
-	}
-	version++
-	a.lspDocVersions[uri] = version
-	a.lspMu.Unlock()
-
-	// Best effort async notification; ignore transient transport errors.
-	go func() {
-		_ = client.DidChange(uri, version, text)
-	}()
+		return client.DidChange(uri, version, text)
+	})
 }
 
 func (a *maneApp) notifyLSPDidSave(buf *editor.Buffer) {
@@ -2300,13 +3051,9 @@ func (a *maneApp) notifyLSPDidSave(buf *editor.Buffer) {
 	if uri == "" || langID == "" {
 		return
 	}
-	client, err := a.lspClientForLanguage(langID)
-	if err != nil {
-		return
-	}
-	go func() {
-		_ = client.DidSave(uri)
-	}()
+	_ = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		return client.DidSave(uri)
+	})
 }
 
 func (a *maneApp) notifyLSPDidClose(buf *editor.Buffer) {
@@ -2318,17 +3065,13 @@ func (a *maneApp) notifyLSPDidClose(buf *editor.Buffer) {
 	if uri == "" || langID == "" {
 		return
 	}
-	client, err := a.lspClientForLanguage(langID)
-	if err != nil {
-		return
-	}
 	a.lspMu.Lock()
 	delete(a.lspDocVersions, uri)
 	delete(a.lspDiagnostics, uri)
 	a.lspMu.Unlock()
-	go func() {
-		_ = client.DidClose(uri)
-	}()
+	_ = a.withRetryingLSPClient(langID, func(client *lsp.Client) error {
+		return client.DidClose(uri)
+	})
 }
 
 // syncTabBar rebuilds the tab bar from the current TabManager state.
@@ -2352,14 +3095,19 @@ func (a *maneApp) switchTab(index int) {
 		text := buf.Text()
 		a.textArea.SetText(text)
 		a.syncMultiCursorFromTextArea()
+		a.clearBlockSelection()
 		a.highlight.setup(filepath.Base(buf.Path()))
 		ranges := a.highlight.highlight([]byte(text))
 		a.applyHighlights(text, ranges)
+		a.updateFoldRegions(text)
 		a.openLSPDocument(buf)
 		a.applyDiagnosticsForActiveBuffer()
 	} else {
 		a.textArea.SetText("")
 		a.highlight.setup("")
+		a.clearBlockSelection()
+		a.foldState.SetRegions(nil)
+		a.textArea.SetVisibleLines(nil)
 		a.lspMu.Lock()
 		a.diagnostics = nil
 		a.lspMu.Unlock()
@@ -2417,6 +3165,9 @@ func (a *maneApp) cmdNewFile() {
 	a.tabs.NewUntitled()
 	a.textArea.SetText("")
 	a.highlight.setup("") // no language for untitled
+	a.clearBlockSelection()
+	a.foldState.SetRegions(nil)
+	a.textArea.SetVisibleLines(nil)
 	a.syncMultiCursorFromTextArea()
 	a.syncTabBar()
 	a.syncBreadcrumbs()
@@ -2436,14 +3187,19 @@ func (a *maneApp) cmdCloseTab() {
 		text := buf.Text()
 		a.textArea.SetText(text)
 		a.syncMultiCursorFromTextArea()
+		a.clearBlockSelection()
 		a.highlight.setup(filepath.Base(buf.Path()))
 		ranges := a.highlight.highlight([]byte(text))
 		a.applyHighlights(text, ranges)
+		a.updateFoldRegions(text)
 		a.openLSPDocument(buf)
 		a.applyDiagnosticsForActiveBuffer()
 	} else {
 		a.textArea.SetText("")
 		a.highlight.setup("")
+		a.clearBlockSelection()
+		a.foldState.SetRegions(nil)
+		a.textArea.SetVisibleLines(nil)
 		a.lspMu.Lock()
 		a.diagnostics = nil
 		a.lspMu.Unlock()
@@ -2472,10 +3228,62 @@ func (a *maneApp) cmdToggleWordWrap() {
 	a.updateStatus()
 }
 
+func closestVisibleLine(visible []int, line int) int {
+	if len(visible) == 0 {
+		return 0
+	}
+	closest := visible[0]
+	for _, candidate := range visible {
+		if candidate > line {
+			break
+		}
+		closest = candidate
+	}
+	return closest
+}
+
+func (a *maneApp) applyFoldVisibility() {
+	text := a.textArea.Text()
+	totalLines := editor.LineCount(text)
+	if totalLines <= 0 {
+		a.textArea.SetVisibleLines(nil)
+		return
+	}
+
+	visible := a.foldState.VisibleLines(totalLines)
+	if len(visible) == 0 || len(visible) == totalLines {
+		a.textArea.SetVisibleLines(nil)
+		return
+	}
+
+	a.textArea.SetVisibleLines(visible)
+	col, row := a.textArea.CursorPosition()
+	if a.foldState.IsLineHidden(row) {
+		a.textArea.SetCursorPosition(col, closestVisibleLine(visible, row))
+	}
+}
+
+func (a *maneApp) ensureLineVisible(line int) {
+	if line < 0 {
+		return
+	}
+	changed := false
+	for a.foldState.IsLineHidden(line) {
+		if !a.foldState.UnfoldAtLine(line) {
+			break
+		}
+		changed = true
+	}
+	if changed {
+		a.applyFoldVisibility()
+	}
+}
+
 // cmdFoldAtCursor folds the region at the current cursor line.
 func (a *maneApp) cmdFoldAtCursor() {
 	_, row := a.textArea.CursorPosition()
 	if a.foldState.FoldAtLine(row) {
+		a.applyFoldVisibility()
 		a.updateStatus()
 	}
 }
@@ -2484,6 +3292,7 @@ func (a *maneApp) cmdFoldAtCursor() {
 func (a *maneApp) cmdUnfoldAtCursor() {
 	_, row := a.textArea.CursorPosition()
 	if a.foldState.UnfoldAtLine(row) {
+		a.applyFoldVisibility()
 		a.updateStatus()
 	}
 }
@@ -2491,29 +3300,28 @@ func (a *maneApp) cmdUnfoldAtCursor() {
 // cmdFoldAll folds all foldable regions.
 func (a *maneApp) cmdFoldAll() {
 	a.foldState.FoldAll()
+	a.applyFoldVisibility()
 	a.updateStatus()
 }
 
 // cmdUnfoldAll unfolds all regions.
 func (a *maneApp) cmdUnfoldAll() {
 	a.foldState.UnfoldAll()
+	a.applyFoldVisibility()
 	a.updateStatus()
 }
 
-// updateFoldRegions detects fold regions from the current buffer text.
-func (a *maneApp) updateFoldRegions() {
-	buf := a.tabs.ActiveBuffer()
-	if buf == nil {
-		return
-	}
-	regions := editor.DetectFoldRegions(buf.Text())
-	a.foldState.SetRegions(regions)
+// updateFoldRegions updates fold regions from tree-sitter when available.
+func (a *maneApp) updateFoldRegions(text string) {
+	a.foldState.SetRegions(a.highlight.detectFoldRegions(text))
+	a.applyFoldVisibility()
 }
 
 // rehighlight runs a synchronous highlight pass and applies the results.
 func (a *maneApp) rehighlight(text string) {
 	ranges := a.highlight.highlight([]byte(text))
 	a.applyHighlights(text, ranges)
+	a.updateFoldRegions(text)
 }
 
 // cmdDeleteLine deletes the line at the current cursor position.
@@ -2641,6 +3449,8 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 	}
 
 	app := newManeApp(treeRoot)
+	setMCPActiveEditor(app)
+	defer setMCPActiveEditor(nil)
 	app.lspCancel = cancel
 	app.lspCtx = ctx
 	app.cancel = func() {
@@ -2714,7 +3524,8 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 		LspComplete:    app.cmdLspComplete,
 		LspDefinition:  app.cmdLspDefinition,
 		LspReferences:  app.cmdLspReferences,
-		LspHover:       app.cmdLspHover,
+		LspHover:       func() { app.cmdLspHoverPanel() },
+		LspDiagnostics: app.cmdLspDiagnostics,
 		LspRename:      func() { app.cmdLspRename() },
 		LspCodeAction:  app.cmdLspCodeAction,
 	})...)
@@ -2765,6 +3576,9 @@ func run(ctx context.Context, paths []string, theme string, opts ...fluffy.AppOp
 }
 
 func (a *maneApp) handleGlobalMouse(mouse runtime.MouseMsg) runtime.HandleResult {
+	if a.isBlockSelectionMode() && mouse.Button != runtime.MouseNone && mouse.Action == runtime.MousePress {
+		a.clearBlockSelection()
+	}
 	if a.isMultiCursorMode() && mouse.Button != runtime.MouseNone && mouse.Action == runtime.MousePress {
 		a.resetMultiCursor()
 	}
@@ -2777,6 +3591,53 @@ func (a *maneApp) handleGlobalPaste(paste runtime.PasteMsg) runtime.HandleResult
 }
 
 func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
+	if key.Alt && key.Shift {
+		switch key.Key {
+		case terminal.KeyUp:
+			a.expandBlockSelection(-1, 0)
+			return runtime.Handled()
+		case terminal.KeyDown:
+			a.expandBlockSelection(1, 0)
+			return runtime.Handled()
+		case terminal.KeyLeft:
+			a.expandBlockSelection(0, -1)
+			return runtime.Handled()
+		case terminal.KeyRight:
+			a.expandBlockSelection(0, 1)
+			return runtime.Handled()
+		}
+	}
+
+	if a.isBlockSelectionMode() {
+		switch key.Key {
+		case terminal.KeyEscape:
+			a.clearBlockSelection()
+			a.updateStatus()
+			return runtime.Handled()
+		case terminal.KeyBackspace:
+			a.applyBlockBackspace()
+			return runtime.Handled()
+		case terminal.KeyDelete:
+			a.applyBlockDeleteForward()
+			return runtime.Handled()
+		case terminal.KeyEnter:
+			a.applyBlockInsert("\n")
+			return runtime.Handled()
+		case terminal.KeyTab:
+			a.applyBlockInsert("\t")
+			return runtime.Handled()
+		case terminal.KeyRune:
+			if !key.Ctrl && !key.Alt && key.Rune != 0 {
+				a.applyBlockInsert(string(key.Rune))
+				return runtime.Handled()
+			}
+		}
+
+		// Leave block mode when another command/navigation key is used.
+		a.clearBlockSelection()
+		a.updateStatus()
+	}
+
 	if a.isMultiCursorMode() {
 		switch key.Key {
 		case terminal.KeyCtrlD:
@@ -2837,6 +3698,10 @@ func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
 			return runtime.Handled()
 		}
 		if key.Ctrl && key.Shift && key.Rune == '}' {
+			a.cmdUnfoldAtCursor()
+			return runtime.Handled()
+		}
+		if key.Ctrl && key.Rune == ']' {
 			a.cmdGotoMatchingBracket()
 			return runtime.Handled()
 		}
@@ -2865,10 +3730,12 @@ func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
 	case terminal.KeyCtrlG:
 		return a.cmdGotoLine()
 	case terminal.KeyF1:
-		a.cmdLspHover()
-		return runtime.Handled()
+		return a.cmdLspHoverPanel()
 	case terminal.KeyF2:
 		return a.cmdLspRename()
+	case terminal.KeyF8:
+		a.cmdLspDiagnostics()
+		return runtime.Handled()
 	case terminal.KeyF12:
 		if key.Shift {
 			a.cmdLspReferences()
@@ -2892,12 +3759,12 @@ func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
 		a.cancel()
 		return runtime.Handled()
 	case terminal.KeyUp:
-		if key.Alt {
+		if key.Alt && !key.Shift {
 			a.cmdMoveLineUp()
 			return runtime.Handled()
 		}
 	case terminal.KeyDown:
-		if key.Alt {
+		if key.Alt && !key.Shift {
 			a.cmdMoveLineDown()
 			return runtime.Handled()
 		}

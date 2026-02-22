@@ -25,12 +25,13 @@ type Actions struct {
 	FoldAll        func()
 	UnfoldAll      func()
 	// LSP actions.
-	LspComplete   func()
-	LspDefinition func()
-	LspReferences func()
-	LspHover      func()
-	LspRename     func()
-	LspCodeAction func()
+	LspComplete    func()
+	LspDefinition  func()
+	LspReferences  func()
+	LspHover       func()
+	LspDiagnostics func()
+	LspRename      func()
+	LspCodeAction  func()
 }
 
 // AllCommands returns the full command list for the palette.
@@ -59,6 +60,7 @@ func AllCommands(a Actions) []widgets.PaletteCommand {
 		{ID: "lsp.definition", Label: "Go to Definition", Shortcut: "F12", Category: "Language", OnExecute: a.LspDefinition},
 		{ID: "lsp.references", Label: "Find References", Shortcut: "Shift+F12", Category: "Language", OnExecute: a.LspReferences},
 		{ID: "lsp.hover", Label: "Show Hover", Shortcut: "F1", Category: "Language", OnExecute: a.LspHover},
+		{ID: "lsp.diagnostics", Label: "Show Diagnostics", Shortcut: "F8", Category: "Language", OnExecute: a.LspDiagnostics},
 		{ID: "lsp.rename", Label: "Rename Symbol", Shortcut: "F2", Category: "Language", OnExecute: a.LspRename},
 		{ID: "lsp.codeAction", Label: "Code Actions", Shortcut: "Ctrl+.", Category: "Language", OnExecute: a.LspCodeAction},
 	}
