@@ -24,6 +24,40 @@ var (
 	mcpEditor   *maneApp
 )
 
+type ResourceNotifier interface {
+	NotifyResourceUpdated(uri string)
+}
+
+type mcpNotifier struct {
+	srv *fluffymcp.Server
+}
+
+func (n *mcpNotifier) NotifyResourceUpdated(uri string) {
+	if n == nil || n.srv == nil {
+		return
+	}
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return
+	}
+	n.srv.SendResourceUpdated(uri)
+}
+
+type mcpCloser struct {
+	srv    io.Closer
+	editor *maneApp
+}
+
+func (c *mcpCloser) Close() error {
+	if c.editor != nil {
+		c.editor.setResourceNotifier(nil)
+	}
+	if c.srv != nil {
+		return c.srv.Close()
+	}
+	return nil
+}
+
 func init() {
 	runtime.RegisterMCPEnabler(enableMCPWithManeExtensions)
 }
@@ -55,12 +89,16 @@ func enableMCPWithManeExtensions(app *runtime.App, opts runtime.MCPOptions) (io.
 		if err := registerMCPRegistry(app, srv, mcptools.NewRegistry(editor)); err != nil {
 			return nil, err
 		}
+		editor.setResourceNotifier(&mcpNotifier{srv: srv})
 	}
 
 	if err := srv.Start(); err != nil {
+		if editor != nil {
+			editor.setResourceNotifier(nil)
+		}
 		return nil, err
 	}
-	return srv, nil
+	return &mcpCloser{srv: srv, editor: editor}, nil
 }
 
 func registerMCPRegistry(app *runtime.App, srv *fluffymcp.Server, reg *mcptools.Registry) error {
@@ -168,6 +206,7 @@ func (a *maneApp) WriteBuffer(path string, text string) error {
 		a.updateStatus()
 	}
 	a.scheduleLspDidChange(buf, text)
+	a.notifyFileResource(buf.Path())
 	return nil
 }
 
@@ -213,7 +252,54 @@ func (a *maneApp) ApplyEdit(path string, startLine, startCol, endLine, endCol in
 		a.updateStatus()
 	}
 	a.scheduleLspDidChange(buf, updated)
+	a.notifyFileResource(buf.Path())
 	return nil
+}
+
+func (a *maneApp) setResourceNotifier(notifier ResourceNotifier) {
+	if a == nil {
+		return
+	}
+	a.notifierMu.Lock()
+	a.notifier = notifier
+	a.notifierMu.Unlock()
+}
+
+func (a *maneApp) notifyResourceUpdated(uri string) {
+	if a == nil {
+		return
+	}
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return
+	}
+	a.notifierMu.RLock()
+	notifier := a.notifier
+	a.notifierMu.RUnlock()
+	if notifier != nil {
+		notifier.NotifyResourceUpdated(uri)
+	}
+}
+
+func (a *maneApp) notifyPathResource(prefix, path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	a.notifyResourceUpdated(prefix + path)
+}
+
+func (a *maneApp) notifyFileResource(path string) {
+	a.notifyPathResource("mane://file/", path)
+}
+
+func (a *maneApp) notifySyntaxResources(path string) {
+	a.notifyPathResource("mane://syntax-tree/", path)
+	a.notifyPathResource("mane://symbols/", path)
+}
+
+func (a *maneApp) notifyDiagnosticsResource(path string) {
+	a.notifyPathResource("mane://diagnostics/", path)
 }
 
 func (a *maneApp) SaveFile(path string) error {

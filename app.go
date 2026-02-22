@@ -373,6 +373,9 @@ type maneApp struct {
 	lspCtx    context.Context
 	lspCancel context.CancelFunc
 	lspMu     sync.Mutex
+
+	notifierMu sync.RWMutex
+	notifier   ResourceNotifier
 }
 
 // newManeApp creates a maneApp with the given root directory for the file tree.
@@ -467,10 +470,13 @@ func newManeApp(treeRoot string) *maneApp {
 		}
 
 		// Debounced re-highlight on text change.
+		path := buf.Path()
 		app.syncMultiCursorFromTextArea()
 		app.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 			app.applyHighlights(text, ranges)
 			app.updateFoldRegions(text)
+			app.notifyFileResource(path)
+			app.notifySyntaxResources(path)
 		})
 
 		app.scheduleLspDidChange(buf, text)
@@ -1789,9 +1795,12 @@ func (a *maneApp) onReplace(search, replace string) {
 
 	// Re-highlight syntax.
 	text := buf.Text()
+	path := buf.Path()
 	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 		a.applyHighlights(text, ranges)
 		a.updateFoldRegions(text)
+		a.notifyFileResource(path)
+		a.notifySyntaxResources(path)
 	})
 }
 
@@ -1821,9 +1830,12 @@ func (a *maneApp) onReplaceAll(search, replace string) {
 
 	// Re-highlight syntax.
 	text := buf.Text()
+	path := buf.Path()
 	a.highlight.scheduleHighlight([]byte(text), func(ranges []gotreesitter.HighlightRange) {
 		a.applyHighlights(text, ranges)
 		a.updateFoldRegions(text)
+		a.notifyFileResource(path)
+		a.notifySyntaxResources(path)
 	})
 }
 
@@ -2906,6 +2918,10 @@ func (a *maneApp) lspClientForLanguage(langID string) (*lsp.Client, error) {
 		a.lspMu.Lock()
 		a.lspDiagnostics[payload.URI] = payload.Diagnostics
 		a.lspMu.Unlock()
+		if strings.HasPrefix(payload.URI, "file://") {
+			path := filePathFromURI(payload.URI)
+			a.notifyDiagnosticsResource(path)
+		}
 	})
 
 	if err := client.Initialize(a.lspCtx, fileURI(a.treeRoot)); err != nil {
@@ -3322,6 +3338,10 @@ func (a *maneApp) rehighlight(text string) {
 	ranges := a.highlight.highlight([]byte(text))
 	a.applyHighlights(text, ranges)
 	a.updateFoldRegions(text)
+	if buf := a.tabs.ActiveBuffer(); buf != nil {
+		a.notifyFileResource(buf.Path())
+		a.notifySyntaxResources(buf.Path())
+	}
 }
 
 // cmdDeleteLine deletes the line at the current cursor position.
@@ -3721,6 +3741,22 @@ func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
 			a.cmdLspCodeAction()
 			return runtime.Handled()
 		}
+		if key.Ctrl && (key.Rune == 's' || key.Rune == 'S') {
+			a.cmdSaveFile()
+			return runtime.Handled()
+		}
+		if key.Ctrl && (key.Rune == 'n' || key.Rune == 'N') {
+			a.cmdNewFile()
+			return runtime.Handled()
+		}
+		if key.Ctrl && (key.Rune == 'w' || key.Rune == 'W') {
+			a.cmdCloseTab()
+			return runtime.Handled()
+		}
+		if key.Ctrl && (key.Rune == 'q' || key.Rune == 'Q') {
+			a.cancel()
+			return runtime.Handled()
+		}
 		if key.Ctrl && key.Alt && (key.Rune == 'w' || key.Rune == 'W') {
 			a.cmdToggleWordWrap()
 			return runtime.Handled()
@@ -3745,18 +3781,6 @@ func (a *maneApp) handleGlobalKey(key runtime.KeyMsg) runtime.HandleResult {
 		return runtime.Handled()
 	case terminal.KeyCtrlB:
 		a.toggleSidebar()
-		return runtime.Handled()
-	case terminal.KeyCtrlS:
-		a.cmdSaveFile()
-		return runtime.Handled()
-	case terminal.KeyCtrlN:
-		a.cmdNewFile()
-		return runtime.Handled()
-	case terminal.KeyCtrlW:
-		a.cmdCloseTab()
-		return runtime.Handled()
-	case terminal.KeyCtrlQ:
-		a.cancel()
 		return runtime.Handled()
 	case terminal.KeyUp:
 		if key.Alt && !key.Shift {
