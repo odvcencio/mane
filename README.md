@@ -4,6 +4,10 @@ A terminal text editor and code workspace built in pure Go, with syntax highligh
 
 Mane focuses on local coding workflows in a terminal UI: multi-tab editing, fast navigation, language-server actions, and web-accessible modes.
 
+## Agent Skill
+
+Agents working with Mane should use the [using-mane](https://github.com/odvcencio/m31labs-skills/blob/main/skills/using-mane/SKILL.md) skill.
+
 ## Install
 
 ```
